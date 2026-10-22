@@ -188,7 +188,7 @@ frontend/app/cache/*
 app_session_data/**
 tests/*
 test_folder/*
-*.bat
+# *.bat
 gms_test/*
 ml_test/*
 backend/api/ml_util/*
