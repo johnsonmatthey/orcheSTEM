@@ -119,8 +119,8 @@ def CUTilt(req: schemas.CompUcentricCal):
 def CUTiltMove(req: schemas.CompUcentricCal):
     axis_data = data_io.local_retrieve(req.folder_path, "compucentric-data", 'json')
     axis_data = axis_data.get('tilt-corrections')
-    angle = 0.1 # make user variable later
-    angle = float(req.sign + str(angle)) 
+    angle = 0.5 # make user variable later
+    angle = eval(req.sign + str(angle)) 
     # req.direction req.sign
     Compucentric_tilt(req, angle=angle, direction=req.direction, Correction_for_x_tilt=axis_data[0], Correction_for_y_tilt=axis_data[1])
     return {"status": "success"}

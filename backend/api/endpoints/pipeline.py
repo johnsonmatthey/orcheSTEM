@@ -19,6 +19,7 @@ router = APIRouter()
 VERIFY_DRIFT = False # This is to acquire an extra image as soon as drift correction is applied to verify things
 RECHECK_DRIFT = False # This is to do a sanity check every 3 scans on the drift correction to catch any large drift that may have occurred
 IMAGING_DETECTOR = MICROSCOPE_CONFIG.get('detector_name')
+RUN_AUTOFOCUS = False
 
 def _write_checkpoints(hdf_path, folder_path, initial_survey, cluster_index):
     """Write reference/checkpoint images into the merlin parameter HDF5 file."""
@@ -107,25 +108,27 @@ def background_pipeline(req):
         microscope.imaging.set_flyback_time(req.scan_flyback_time_us / 1e6)
 
         # Apply accumulated drift to focus box coords
-        focus_subscan = None
-        if req.focus.focus_region == "box":
-            fw, fh, fx1, fy1 = rescale_coords(width, height, x1, y1, scan_rescaling)
-            fx1 += int(overall_drift_vector[0])
-            fy1 += int(overall_drift_vector[1])
-            # clamp to scan bounds
-            fx1 = max(0, min(int(fx1), full_image_size - int(fw)))
-            fy1 = max(0, min(int(fy1), full_image_size - int(fh)))
-            focus_subscan = (fw, fh, fx1, fy1)
-        microscope.lenses.autofocus(
-            imaging=microscope.imaging, 
-            method = req.focus.focus_method,
-            focus_region = req.focus.focus_region, # can be full or box
-            full_image_size= (full_image_size, full_image_size),
-            survey_image_size= (survey_image_size, survey_image_size),
-            subscan_region = focus_subscan, # only used if focus_region is box
-            save_path = focus_output_path,
-            region_loop_num = i
-        )
+        # no autofocus! ##################################################################################################################################
+        if RUN_AUTOFOCUS:
+            focus_subscan = None
+            if req.focus.focus_region == "box":
+                fw, fh, fx1, fy1 = rescale_coords(width, height, x1, y1, scan_rescaling)
+                fx1 += int(overall_drift_vector[0])
+                fy1 += int(overall_drift_vector[1])
+                # clamp to scan bounds
+                fx1 = max(0, min(int(fx1), full_image_size - int(fw)))
+                fy1 = max(0, min(int(fy1), full_image_size - int(fh)))
+                focus_subscan = (fw, fh, fx1, fy1)
+            microscope.lenses.autofocus(
+                imaging=microscope.imaging, 
+                method = req.focus.focus_method,
+                focus_region = req.focus.focus_region, # can be full or box
+                full_image_size= (full_image_size, full_image_size),
+                survey_image_size= (survey_image_size, survey_image_size),
+                subscan_region = focus_subscan, # only used if focus_region is box
+                save_path = focus_output_path,
+                region_loop_num = i
+            )
 
         if req.drift.drift_every > 0 and i % req.drift.drift_every == 0:
             microscope.imaging.set_dwell_time(req.drift.dwell_time_us * 1e-6)
@@ -160,11 +163,12 @@ def background_pipeline(req):
             print(f"original drift box coords (in survey res): {req.drift.box_coords}")
 
             # move to the defocus used when the drift region was initially acquired then restore the current defocus
-            _drift_defocus = data_io.local_retrieve(
-                os.path.join(req.folder_path, "drift_survey"),
-                "drift_survey-0-defocus",
-                data_type='json',
-            )
+            # _drift_defocus = data_io.local_retrieve(
+            #     os.path.join(req.folder_path, "drift_survey"),
+            #     "drift_survey-0-defocus",
+            #     data_type='json',
+            # )
+            _drift_defocus = None # no defocus changes to avoid issues ##################################################################################################################################
             _current_defocus = microscope.lenses.get_defocus()
             if _drift_defocus is not None and _current_defocus is not None:
                 print(f"Setting defocus to drift OLf={_drift_defocus} (current OLf={_current_defocus})")

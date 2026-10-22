@@ -152,3 +152,17 @@ class CompUcentricCal(BaseModel):
     stage_method:str
     lenses_method:str
     imaging_method:str
+
+class DiffTiltCal(BaseModel):
+    folder_path:str
+    filename:str | None = None
+    direction:str
+    sign:str
+    survey_image_size: int | None = None
+    dwell_time_us:int = 15
+    flyback_time_us:int = 500
+    # hardware options
+    stage_method:str
+    lenses_method:str
+    imaging_method:str
+    stem4d: STEM4DSettings | None = None # None means no 4D-STEM acquisition, otherwise will acquire with these settings

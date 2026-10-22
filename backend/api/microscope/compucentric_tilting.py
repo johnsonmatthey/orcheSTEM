@@ -5,7 +5,7 @@ from skimage.transform import warp_polar
 from microscope.drift_corr import  drift_calc #this is the only thing in this file, could be moved to util? 
 from skimage.io import imread
 from data_models import schemas
-from util import data_io, preprocess
+from util import data_io, preprocess, mib_conv_single
 from microscope.controller import build_controller
 # for test purposes
 import skimage as ski 
@@ -71,6 +71,7 @@ def Compucentric_calibration(req: schemas.CompUcentricCal):
                     savefolder=abs_savefolder,
                     savefile=f"{req.filename}_{pos[0]}_{pos[1]}_{tilt[0]}_{tilt[1]}_before"
                 )
+
                 data_io.local_store(abs_savefolder, f"{req.filename}_{pos[0]}_{pos[1]}_{tilt[0]}_{tilt[1]}_before", preprocess.bytescale(Image1), data_type='png')
             for i in range(number_of_steps):
                 microscope.stage.move_relative(magnitude= round(pos[0]/number_of_steps, 1), axis =pos[1]) # assume minimum step size for instrument function is 0.1
@@ -161,19 +162,21 @@ def Compucentric_calibration(req: schemas.CompUcentricCal):
     # Correction needed for the following function, calibrations can be saved for later sanity check, position needed if going to warn the user to update if far away, orientations could be used to display little axis to the user. 
     return tuple(Correction_for_x_tilt), tuple(Correction_for_y_tilt), Shift_calibration, Tilt_calibrations, Calibration_postion, Shift_orientation, Tilt_orientation
 
-def Compucentric_tilt(req: schemas.CompUcentricCal, angle=0.1, direction='x', Correction_for_x_tilt=[0,0], Correction_for_y_tilt=[0,0]): #defaults used to not move if called incorrectly.
+def Compucentric_tilt(req: schemas.CompUcentricCal, angle=0.5, direction='x', Correction_for_x_tilt=[0,0], Correction_for_y_tilt=[0,0]): #defaults used to not move if called incorrectly.
     # Build microscope controller based on config 
     microscope = build_controller(req.stage_method, req.lenses_method, req.imaging_method)
-    direction = req.sign+req.direction
+    direction = req.direction
+    #anglesign = eval(req.sign+str(angle)) # survey callback already does this
+    print(f'Attempting to tilt {angle} degrees around the {req.sign+req.direction} axis.')
     # angle = req.magnitude
-    number_of_steps = 10 #to minimise backlash, break up the movement into this many steps.
+    number_of_steps = 5 #to minimise backlash, break up the movement into this many steps.
     for i in range(number_of_steps):
         microscope.stage.tilt_relative(degrees=round(angle/number_of_steps, 1), axis = direction) # assume minimum step size is 0.1
     if direction == 'x':
         for i in range(number_of_steps):
-            microscope.stage.move_relative(round(angle*Correction_for_x_tilt[0]/number_of_steps, 1), axis = 'x') # assume minimum step size is 0.1
+            microscope.stage.move_relative(round(angle*Correction_for_x_tilt[1]/number_of_steps, 1), axis = 'x') # assume minimum step size is 0.1
         for i in range(number_of_steps):
-            microscope.stage.move_relative(round(angle*Correction_for_x_tilt[1]/number_of_steps, 1), axis = 'y')  
+            microscope.stage.move_relative(round(angle*Correction_for_x_tilt[0]/number_of_steps, 1), axis = 'y')  
     elif direction == 'y':
         for i in range(number_of_steps):
             microscope.stage.move_relative(round(angle*Correction_for_y_tilt[0]/number_of_steps, 1), axis = 'x')
@@ -228,43 +231,85 @@ def Diffraction_change(Image1, Image2):
     return COM1-COM2, COM1, COM2
 
 
-def Diffraction_tilt_orientation(PYJEM_STAGE, survey_image_size:int):
-    if PYJEM_STAGE is None:
-        Calibration_postion = [0,0]
-    else:
-        Calibration_postion = get_stage_position(PYJEM_STAGE)
-    # repeat but this time need to follow the changes in the diffraction space not a real space drift cal. 
+def Diffraction_tilt_orientation(req: schemas.DiffTiltCal):
+    # Build microscope controller based on config 
+    microscope = build_controller(req.stage_method, req.lenses_method, req.imaging_method, req.stem4d)
+    microscope.imaging.set_dwell_time(req.dwell_time_us * 1e-6) # in seconds
+    microscope.imaging.set_flyback_time(req.flyback_time_us * 1e-6) # in seconds
+
+    # if PYJEM_STAGE is None:
+    #     Calibration_postion = [0,0]
+    # else:
+    #     Calibration_postion = get_stage_position(PYJEM_STAGE)
+    # # repeat but this time need to follow the changes in the diffraction space not a real space drift cal. 
 
     magnitude = 10 # size of stage shift
     angle = 1 # size of stage tilt
-
-    positions = [(0,'x'), (0,'x'), (0,'x'), (0,'x')]
-    tilts = [(angle, 'x'), (-angle, 'x'), (angle, 'y'), (-angle, 'y')]
+    number_of_steps = 10 #to minimise backlash, break up the movement into this many steps. Could make this a user defined number. Could also put it as a variable in the controller abstract method in order to allow user to select backlash-proof movement?
+    positions = [(magnitude, 'x'), (-magnitude, 'x'), (magnitude, 'y'), (-magnitude, 'y'), (0,'x'), (0,'x'), (0,'x'), (0,'x')]
+    tilts = [(0,'x'), (0,'x'), (0,'x'), (0,'x'), (angle, 'x'), (-angle, 'x'), (angle, 'y'), (-angle, 'y')]
     shifts = []
-    height = survey_image_size
-    width = survey_image_size
+    height = req.survey_image_size
+    width = req.survey_image_size
 
     for pos, tilt in zip(positions, tilts):
-        if PYJEM_STAGE is None:
-            Image1 = imread("test.bmp", as_gray=True)
-            img = imread("test.bmp", as_gray=True)
-            tform = ski.transform.EuclideanTransform(
-                        rotation=tilt[0]*np.pi,
-                        translation = (pos[0]+10, 10-pos[0])
-                        )
-            Image2 = ski.transform.warp(img, tform.inverse)
+        abs_savefolder = Path(req.folder_path).resolve().as_posix()
+        with microscope.lenses.detector_inserted(IMAGING_DETECTOR):
+            with microscope.lenses.beam_unblanked():
+                Image1 = microscope.imaging.get_image( #ADF image saved for sanity
+                    full_image_size=[height, width],
+                    savefolder=abs_savefolder,
+                    savefile=f"{req.filename}_{pos[0]}_{pos[1]}_{tilt[0]}_{tilt[1]}_after"
+                )
+                data_io.local_store(abs_savefolder, f"{req.filename}_{pos[0]}_{pos[1]}_{tilt[0]}_{tilt[1]}_before", preprocess.bytescale(Image1), data_type='png')
+                Image1_DP = microscope.stem4d_detector.acquire(
+                    lenses=microscope.lenses,
+                    full_image_size=(full_image_size, full_image_size),
+                    subscan_region=(width, height, x1, y1),
+                    merlin_dwell_time_s=req.stem4d.dwell_time_us / 1e6, # convert from us to s
+                    merlin_save_path= req.stem4d.savepath,
+                    merlin_bit_depth= req.stem4d.bitdepth,
+                )
+                merlin_save = req.stem4d.savepath.replace("/", "\\")
+                mib_savepath = f"{merlin_save}\\{Image1_DP}"
+                DP1 = mib_conv_single.Grab_first_mib_frame(mib_savepath)
+            for i in range(number_of_steps):
+                microscope.stage.move_relative(magnitude= round(pos[0]/number_of_steps, 1), axis =pos[1]) # assume minimum step size for instrument function is 0.1
+            for i in range(number_of_steps):    
+                microscope.stage.tilt_relative(degrees= round(tilt[0]/number_of_steps, 1), axis = tilt[1]) # assume minimum step size is 0.1
+
+            with microscope.lenses.beam_unblanked():
+                Image2 = microscope.imaging.get_image( #ADF image saved for sanity
+                    full_image_size=[height, width],
+                    savefolder=abs_savefolder,
+                    savefile=f"{req.filename}_{pos[0]}_{pos[1]}_{tilt[0]}_{tilt[1]}_after"
+                )
+                data_io.local_store(abs_savefolder, f"{req.filename}_{pos[0]}_{pos[1]}_{tilt[0]}_{tilt[1]}_after", preprocess.bytescale(Image2), data_type='png')
+                Image2_DP = microscope.stem4d_detector.acquire(
+                    lenses=microscope.lenses,
+                    full_image_size=(full_image_size, full_image_size),
+                    subscan_region=(width, height, x1, y1),
+                    merlin_dwell_time_s=req.stem4d.dwell_time_us / 1e6, # convert from us to s
+                    merlin_save_path= req.stem4d.savepath,
+                    merlin_bit_depth= req.stem4d.bitdepth,
+                )
+                mib_savepath = f"{merlin_save}\\{Image2_DP}"
+                DP2 = mib_conv_single.Grab_first_mib_frame(mib_savepath)
+        if Image1 is None:
+            print('no image')
+            Shift = (pos[0], tilt[0])
         else:
-            Image1 = get_image(
-                mydet= PYJEM_DET, 
-                Height = height,
-                Width = width
-            )
-            set_pos_rel(PYJEM_STAGE,*pos)
-            set_tilt_rel(PYJEM_STAGE,*tilt)
-            Image2 = get_image(
-                mydet= PYJEM_DET, 
-                Height = height,
-                Width = width
-            )
-        Shift, _ = Diffraction_change(Image1, Image2)
+            print('images for cross calc', np.shape(Image1))
+            Shift, _ = drift_calc(Image1, Image2, max_shift_pixel=req.survey_image_size)
+            print('shift found ', Shift)
         shifts.append(Shift)
+
+        h, w = np.shape(DP1)
+        Ramp = np.linspace(-1,1,h) # assume h=w 
+        im_rampx, im_rampy = np.meshgrid(Ramp, Ramp)
+        COMx1 = np.sum(np.multiply(im_rampx,DP1/np.sum(DP1)))*h/2 # value in pixels from center
+        COMy1 = np.sum(np.multiply(im_rampy,DP1/np.sum(DP1)))*h/2 # value in pixels from center
+        COMx2 = np.sum(np.multiply(im_rampx,DP2/np.sum(DP2)))*h/2 # value in pixels from center
+        COMy2 = np.sum(np.multiply(im_rampy,DP2/np.sum(DP2)))*h/2 # value in pixels from center
+        COMx_shift = COMx1-COMx2
+        COMy_shift = COMy1-COMy2

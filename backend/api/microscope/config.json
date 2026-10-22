@@ -1,7 +1,7 @@
 {
     "hostname": "10.182.0.5",
     "port": 12345,
-    "detector_name": "ADF1",
+    "detector_name": "HAADF",
     "qd_enabled_inputs": [
         3
     ],
@@ -14,14 +14,18 @@
     },
     "preferences": {
         "control": {
-            "stage": "pyjem",
-            "lenses": "pyjem",
-            "imaging": "qd_scanengine",
-            "4dstem_detector": "merlin",
+            "stage": null,
+            "lenses": null,
+            "imaging": null,
+            "4dstem_detector": null,
             "stemsi_detector": null
         },
         "4dstem": {
-            "save_path": "X:\\data\\2026\\mg44468-3\\Merlin\\ptnp",
+<<<<<<< Updated upstream
+            "save_path": "X:\\data\\2026\\mg44468-1\\processing\\20260413_merlin_tests\\Merlin15_newarea_recheck_fix",
+=======
+            "save_path": "X:\\data\\2026\\mg44446-2\\Merlin\\W_thin_test2",
+>>>>>>> Stashed changes
             "dwell_time_us": 1000,
             "flyback_time_us": 10000,
             "bit_depth": 6

@@ -2,7 +2,7 @@
 import queue
 import time
 import numpy as np
-from rsciio import digitalmicrograph as dm
+# from rsciio import digitalmicrograph as dm
 from scipy.ndimage import binary_dilation
 
 from microscope.controller import ImagingController, STEMSpectroscopy
