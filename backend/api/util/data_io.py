@@ -147,10 +147,12 @@ def read_image(path:str):
             
     #     # image = imshow.add_scalebar(image, pixel_size=pixel_size, pixel_units=pixel_units)
     #     return bytescale(image), pixel_size, pixel_units
-    image = bytescale(cv2.imread(path,cv2.IMREAD_GRAYSCALE))
+    image = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return None, None, None
     pixel_size = 1
     pixel_units = 'pixels'
-    return image, pixel_size, pixel_units
+    return bytescale(image), pixel_size, pixel_units
 
 def dict_to_json(file_name, dictionary):
     json_object = json.dumps(dictionary, indent = 4) 

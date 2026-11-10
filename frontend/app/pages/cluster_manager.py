@@ -12,9 +12,9 @@ def layout():
                             dmc.GridCol([
                                 dcc.Graph(
                                     id='graph-survey-image-clustering',
-                                    # Enable the rectangle drawing tool by default
+                                    # Enable the lasso (freeform) drawing tool by default
                                     config={
-                                        "modeBarButtonsToAdd": ["drawrect", "eraseshape"],
+                                        "modeBarButtonsToAdd": ["drawclosedpath", "drawrect", "eraseshape"],
                                         "displayModeBar": True, 
                                         # "scrollZoom": True
                                     },
@@ -37,6 +37,7 @@ def layout():
                                     dmc.Divider(label="Region Management", labelPosition="center"),
                                     dmc.Group([
                                         dmc.Button("Reset to Watershed", id="btn-reset-boxes", variant="outline", color="red"),
+                                        dmc.Button("Cluster", id="button-cluster", variant='outline')
                                     ], grow=True),
                                     
                                     dmc.Divider(label="Search Pipeline Configuration", labelPosition="center"),
@@ -136,6 +137,9 @@ def layout():
 
 
                                     ]),
+                                    dmc.Space(h=10),
+                                    dmc.Divider(label="Finalise Position", labelPosition="center"),
+                                    dmc.Button("Store Position Configuration", id="button-store-pipe", fullWidth=True, color="green", size="md", disabled=True),
                                 
                                 
                                 ])

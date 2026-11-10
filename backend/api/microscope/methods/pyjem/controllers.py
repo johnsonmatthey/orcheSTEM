@@ -3,16 +3,17 @@ import os
 import numpy as np
 import time 
 from contextlib import contextmanager
-
-from microscope.controller import StageController, ImagingController, LensController
-from microscope.drift_corr import drift_calc
-from microscope.focus_loop import _norm_var, _parabolic_fit, plot_coarse_range
+import time
+from microscope.core.interfaces import StageController, ImagingController, LensController
+from microscope.methods.gatan.controllers import GatanImaging
+from microscope.techniques.drift_corr import drift_calc
+from microscope.techniques.focus_loop import _norm_var, _parabolic_fit, plot_coarse_range
+from microscope.core.hardware_utils import requires_controller
 from util import data_io 
 from util.preprocess import bytescale
-DETECTOR_MAPPING = {
-    "HAADF" : 10, # THIS NEEDS TO BE TAKE FROM THE CONFIG OR HAVE PRESETS PER MICROSCOPE! HAADF for GrandARM
-    "ADF1" : 10 # THIS NEEDS TO BE TAKE FROM THE CONFIG OR HAVE PRESETS PER MICROSCOPE! HAADF for GrandARM
-
+UNIT_TO_ANGSTROM = {
+    "nm": 10.0,
+    "um": 1e4, "\u00b5m": 1e4,
 }
 
 def corners_to_pyjem(x1,y1, x2,y2):
@@ -22,10 +23,12 @@ def corners_to_pyjem(x1,y1, x2,y2):
     y_top_left = min(y1, y2)
     return (width, height, x_top_left, y_top_left)
 
+
 class PyJEMStage(StageController):
     def __init__(self, tem3_stage):
         self._stage = tem3_stage
 
+    @requires_controller("_stage")
     def get_position(self):
         """Looped as retrieval sometimes fails on first try"""
         current_pos = None
@@ -47,27 +50,48 @@ class PyJEMStage(StageController):
         # setup as dict
         return current_pos
 
+    @requires_controller("_stage")
     def move_absolute(self, value, axis='x'):
         try:
-            func = self._stage.SetY if axis == 'y' else self._stage.SetX
-            func(value)
+            axis_funcs = {
+                'x': self._stage.SetX,
+                'y': self._stage.SetY,
+                'z': self._stage.SetZ
+            }
+            axis_funcs[axis.lower()](value)
             print(f"{axis} moved to {value}!")
         except Exception as e:
             print(e)
             pass
     
+    @requires_controller("_stage")
     def move_relative(self, magnitude, axis='x'):
         try:
-            func = self._stage.SetYRel if axis == 'y' else self._stage.SetXRel
-            func(magnitude)
+            axis_funcs = {
+                'x': self._stage.SetXRel,
+                'y': self._stage.SetYRel,
+                'z': self._stage.SetZRel
+            }
+            axis_funcs[axis.lower()](magnitude)
             print(f"{axis} shifted by {magnitude}!")
         except Exception as e:
             print(e)
             pass
 
+    @requires_controller("_stage")
     def tilt_relative(self, degrees, axis='x'):
         try:
             func = self._stage.SetTYRel if axis == 'y' else self._stage.SetTXRel
+            func(degrees)
+            print(f"{axis} tilt shifted by {degrees}!")
+        except Exception as e:
+            print(e)
+            pass
+
+    @requires_controller("_stage")
+    def tilt_absolute(self, degrees, axis='x'):
+        try:
+            func = self._stage.SetTiltYAngle if axis == 'y' else self._stage.SetTiltXAngle
             func(degrees)
             print(f"{axis} tilt shifted by {degrees}!")
         except Exception as e:
@@ -80,14 +104,19 @@ class PyJEMImaging(ImagingController):
         self._current_det = detector # This refers to the detector instance created by detector.Detector(), not the Detector3() controller
 
     def set_dwell_time(self, dwell_time_s):
-        pass  # PyJEM doesn't have explicit dwell control
+        pass  # TODO add dwell time control
 
     def set_flyback_time(self, flyback_time_s):
-        pass
+        pass  # TODO add flyback time control
 
-    def get_image(self, full_image_size, subscan_region=None, verbose = False, **kwargs):
+    @requires_controller("_current_det")
+    def get_image(self, full_image_size, subscan_region=None, survey_image_size = None, verbose = False, **kwargs):
         if subscan_region:
-            return self._subscan(box_coords=subscan_region)
+            return self._subscan(
+                box_coords=subscan_region,
+                full_image_size=full_image_size,
+                survey_image_size=survey_image_size,
+            )
         return self._full_image(Height=full_image_size[1], Width=full_image_size[0])
 
     def _full_image(self, Height = None, Width = None):
@@ -110,40 +139,56 @@ class PyJEMImaging(ImagingController):
         array = np.frombuffer(buffer, dtype = np.uint16)
         array = np.frombuffer(array, dtype = '<i2')
         array = array.reshape((Height,Width)).astype(np.int16)
+
+        # FOR ACE! - to put in config or auto check method for reading the buffer depending on microscope imaging settings
+        # array = np.frombuffer(buffer, dtype = np.uint16)
+        # array = np.frombuffer(array, dtype = '<u2')
+        # array = array.reshape((Height,Width))
         # array = bytescale(array) # scaling to 0-255 error when from np.int16 to uint8
         return array
 
     def _subscan(
-        self, box_coords
+        self, box_coords, full_image_size, survey_image_size=None
     ):
         """
-        box_coords = (width, height, x, y), (x,y)= top left
+        box_coords = (width, height, x, y), (x,y)= top left, relative to full_image_size
+        full_image_size = (width, height) of the resolution that box_coords' x1,y1 are defined in (e.g. 4096x4096).
+        survey_image_size = (width, height) to reset the imaging area to afterwards (e.g. survey resolution).
         """
-        self._current_det.set_scanmode(3)
-        width, height, x1,y1 = box_coords
-        self._current_det.set_areamode_imagingarea(
-            width,
-            height,
-            x1,
-            y1
-        )
-        arr = self._full_image(
-            Height = height,
-            Width = width
-        )
-        # get_image_path(
-        #     mydet = mydet,
-        #     savepath = f"image-{num}"
-        # )
-        self._current_det.set_scanmode(0)  # back to full scan
-        time.sleep(1)
+        arr = None
+        try:
+            self._current_det.set_scanmode(3)
+            self._current_det.set_imaging_area(full_image_size[0], full_image_size[1])
+            width, height, x1,y1 = box_coords
+            self._current_det.set_areamode_imagingarea(
+                width,
+                height,
+                x1,
+                y1
+            )
+            # time.sleep(2)
+            arr = self._full_image(
+                Height = height,
+                Width = width
+            )
+            # get_image_path(
+            #     mydet = mydet,
+            #     savepath = f"image-{num}"
+            # )
+        except Exception as e:
+            print("pyjem subscan failed:", e)
+        finally:
+            self._current_det.set_scanmode(0)  # back to full scan
+            restore_size = survey_image_size if survey_image_size is not None else full_image_size
+            if restore_size is not None:
+                self._current_det.set_imaging_area(restore_size[0], restore_size[1])
+            time.sleep(1)
 
         return arr
     
     def drift_correct(self, lenses:LensController, survey_size, initial_survey_img, drift_subscan_coords=None,
                       max_shift_pixel=None, window_type='hanning', **kwargs):
         """
-        This could be in the ABC ...
         lenses: LensController object to control beam blanking etc during drift correction
         survey_size: size of the survey image e.g. (512,512) needed to set scan size for drift correction scan. Assumed to be width,height
         initial_survey_img: initial survey image as reference
@@ -151,6 +196,7 @@ class PyJEMImaging(ImagingController):
         max_shift_pixel: maximum allowed shift in pixels to prevent outliers
         window_type: type of windowing to apply to images before phase correlation, options are 'hanning', 'sobel', 'median'
         """
+        # This could be in the ABC ...?
         if drift_subscan_coords is None:
             x1, y1 = 0, 0
             width, height = survey_size[1], survey_size[0]
@@ -179,19 +225,21 @@ class PyJEMImaging(ImagingController):
 
 class PyJEMLenses(LensController):
     """Wraps the existing Def3/Detector3 beam/detector functions."""
-    def __init__(self, def3_controller, det3_controller, eos3_controller, lens3_controller):
+    def __init__(self, def3_controller, det3_controller, eos3_controller, lens3_controller, detector_name: str, detector_mapping: dict, imaging_detector=None):
+        if detector_name not in detector_mapping:
+            raise ValueError(f"Detector '{detector_name}' is not in the instrument's pyjem detector_mapping {list(detector_mapping)}")
+        self._imaging_detector = imaging_detector # detector.Detector of the PyJEM method, used for pixel size when imaging with the QD ScanEngine
+        self._detector_id = detector_mapping[detector_name] # PyJEM id of the instrument's imaging detector needed for insertion/removal
         self._def3 = def3_controller # Deflectors via the Def3()
         self._det3 = det3_controller # Detector3(), not the actual detector, which is accessed via self._det3.Detector()
         self._eos3 = eos3_controller # EOS3()
         self._lens3 = lens3_controller # Lens3()
 
+    @requires_controller("_def3", unavailable_return=False)
     def beam_blank(self, blank=True, delay=1.5):
         """
         Toggle beam blanking and wait a delay to ensure blanking is applied
         """
-        if self._def3 is None:
-            print("Beam blanking controller not available. Skipping.")
-            return False
         try:
             self._def3.SetBeamBlank(int(blank))
             time.sleep(delay)
@@ -210,55 +258,48 @@ class PyJEMLenses(LensController):
             self.beam_blank(blank=True, delay=delay)
 
 
-    def set_detector_position(self, detector_name:str = "ADF1", inserted = False, delay = 4.0):
+    @requires_controller("_det3", unavailable_return=False)
+    def set_detector_position(self, inserted: bool = False, delay: float = 4.0):
         """
-        detector:
-            10 = ADF1 or 10 = HAADF on ACE
-        change:
+        Insert or remove the instrument's imaging detector
+        inserted:
             False = Remove
             True = Insert
         """
-        # return True
-        detector_int = DETECTOR_MAPPING[detector_name]
-
-        if self._det3 is not None:
-            self._det3.SetPosition(int(detector_int), int(inserted))
-            if delay > 0:
-                time.sleep(delay) # wait for the change to stabilise
-            return True
-        else:
-            print("Detector position controller not available. Skipping.")
-            return False
+        self._det3.SetPosition(int(self._detector_id), int(inserted))
+        if delay > 0:
+            time.sleep(delay) # wait for the change to stabilise
+        return True
         
     @contextmanager
-    def detector_inserted(self, detector_name="ADF1", delay=4.0):
-        self.set_detector_position(detector_name, True, delay=delay)
+    def detector_inserted(self, delay: float = 4.0):
+        self.set_detector_position(True, delay=delay)
         try:
             yield
         finally:
-            self.set_detector_position(detector_name, False, delay=delay)  
+            self.set_detector_position(False, delay=delay)  
 
     @contextmanager
-    def detector_removed(self, detector_name="ADF1", delay=4.0):
-        self.set_detector_position(detector_name, False, delay=delay)
+    def detector_removed(self, delay: float = 4.0):
+        self.set_detector_position(False, delay=delay)
         try:
             yield
         finally:
-            self.set_detector_position(detector_name, True, delay=delay)
+            self.set_detector_position(True, delay=delay)
 
+    @requires_controller("_lens3")
     def get_defocus(self):
         """Return the current OLf value, or None if lens control unavailable."""
-        if self._lens3 is None:
-            return None
         try:
             return self._lens3.GetOLf()
         except Exception as e:
             print(f"get_defocus failed: {e}")
             return None
 
+    @requires_controller("_lens3")
     def set_defocus(self, olf_value):
         """Set the OLf value. Does nothing if lens control unavailable."""
-        if self._lens3 is None or olf_value is None:
+        if olf_value is None:
             return
         try:
             self._lens3.SetOLf(int(olf_value))
@@ -266,14 +307,91 @@ class PyJEMLenses(LensController):
         except Exception as e:
             print(f"set_defocus failed: {e}")
 
-    def get_px_res(self, pyjem_imaging: PyJEMImaging):
+    @requires_controller("_eos3")
+    def get_magnification(self):
+        """Return the current absolute magnification value, or None if unavailable."""
+        try:
+            return int(self._eos3.GetMagValue()[0])
+        except Exception as e:
+            print(f"get_magnification failed: {e}")
+            return None
+
+    @requires_controller("_eos3", unavailable_return=False)
+    def set_magnification(self, target_mag, max_steps=20):
+        """Go to target mag by stepping through up/down until matches or max steps. Returns True only if target_mag was reached"""
+        if target_mag is None:
+            print("No target mag defined. Skipping set mag.")
+            return False
+        print('attempting to reach mag:', target_mag)
+        current_mag = self.get_magnification()
+        # loop through mags
+        steps = 0
+        while current_mag is not None and current_mag != target_mag and steps < max_steps:
+            was_below = current_mag < target_mag
+            try:
+                self._eos3.UpSelector() if was_below else self._eos3.DownSelector()
+                current_mag = self.get_magnification()
+                time.sleep(0.1)
+            except Exception as e:
+                print(f"Failed while stepping magnification: {e}. Aborting.")
+                return False
+            steps += 1
+            # moved past the desired mag so must not be a valid increment
+            if current_mag is not None and current_mag != target_mag and (current_mag < target_mag) != was_below:
+                print(f"Target magnification {target_mag} is not a valid step (passed it, now at {current_mag}).")
+                return False
+        if current_mag != target_mag:
+            print(f"Could not reach target magnification {target_mag} after {steps} steps (ended at {current_mag}).")
+            return False
+        print(f"Magnification set to {target_mag} in {steps} steps.")
+        return True
+
+    @requires_controller("_eos3", unavailable_return=False)
+    def increment_magnification(self, steps:int):
+        """Adjust magnification by relative selector steps"""
+        try:
+            selector = self._eos3.UpSelector if steps > 0 else self._eos3.DownSelector
+            for _ in range(abs(steps)):
+                selector()
+                time.sleep(0.1) # short delay 
+            return True
+        except Exception as e:
+            print(f"Magnification adjustment failed: {e}")
+            return False
+
+    def get_px_res(self, pyjem_imaging, savefolder=None, savefile=None, **kwargs):
         """
-        Given detector, will retrieve the magnification and output the resolution
+        Given detector, will retrieve the magnification and output the resolution if pyjem imaging
+        Else get via dm4 for gatan else get directly from detector if qd_scanengine
         Returns in Angstroms
         """
+        if isinstance(pyjem_imaging, GatanImaging):
+            if savefolder is None or savefile is None:
+                print("Gatan pixel resolution requires a saved image (savefolder/savefile). Skipping.")
+                return None
+            from rsciio import digitalmicrograph as dm
+            try:
+                dm_dataset = dm.file_reader(f"{savefolder}/{savefile}.dm4")[0]
+                dm_image_cal = dm_dataset['original_metadata']['ImageList']['TagGroup0']['ImageData']['Calibrations']['Dimension']['TagGroup0']
+                scale = float(dm_image_cal['Scale'])
+                units = str(dm_image_cal['Units'])
+                print(scale, units)
+            except Exception as e:
+                print(f"Failed to read Gatan pixel calibration from {savefolder}/{savefile}: {e}")
+                return None
+            unit_factor = UNIT_TO_ANGSTROM.get(units)
+            if unit_factor is None:
+                print(f"Unrecognised Gatan pixel calibration units '{units}'. Skipping.")
+                return None
+            return scale * unit_factor
+
         magnification = self._eos3.GetMagValue()[0]
-        #Get the pixels per meter value
-        detectorData = pyjem_imaging._current_det.get_detectorsetting()
+        # QD ScanEngine has no detector object so use the PyJEM method's detector
+        current_det = getattr(pyjem_imaging, "_current_det", None) or self._imaging_detector
+        if current_det is None:
+            print("No PyJEM detector available for pixel resolution lookup. Skipping.")
+            return None
+        detectorData = current_det.get_detectorsetting()
         ppmh = detectorData['OutputImageInformation']['PixelsPerMeter']['Horizontal']
         pixel_size = 1 / (ppmh * magnification)
         pixel_size *= 10**(10) # convert m to angstroms
@@ -281,23 +399,29 @@ class PyJEMLenses(LensController):
     
     def autofocus(self, imaging: ImagingController, method = "pyjem", focus_region = 'full', full_image_size = None, survey_image_size = None, subscan_region = None,  **kwargs):
         # autofocus
+        print("running autofocus: ", method)
         if method == "pyjem" and isinstance(imaging, PyJEMImaging):
             if focus_region == 'box' and subscan_region is not None:
                 print("Running PyJEM autofocus on subscan region...")
-                imaging._current_det.set_scanmode(3)
-                width, height, x1,y1 = subscan_region
-                imaging._current_det.set_areamode_imagingarea(
-                    width,
-                    height,
-                    x1,
-                    y1
-                )
-                imaging._current_det.AutoFocus() # inbuilt PyJEM autofocus on subscan region
-                imaging._current_det.set_scanmode(0)  # back to full scan
+                try:
+                    imaging._current_det.set_scanmode(3)
+                    width, height, x1,y1 = subscan_region
+                    imaging._current_det.set_areamode_imagingarea(
+                        width,
+                        height,
+                        x1,
+                        y1
+                    )
+                    imaging._current_det.AutoFocus() # inbuilt PyJEM autofocus on subscan region
+                except Exception as e:
+                    print("Failed to do autofocus: ", e)
+                finally:
+                    imaging._current_det.set_scanmode(0)  # back to full scan
             else:
                 print("Running PyJEM autofocus on full image...")
                 imaging._current_det.AutoFocus() # inbuilt PyJEM autofocus on full image
             time.sleep(1)
+            return None
 
         elif self._lens3 is not None:
             # Run custom method here
@@ -441,7 +565,7 @@ class PyJEMLenses(LensController):
 
         self._lens3.SetOLf(int(ideal_OLf))
 
-        final_offset_bits = int(final_offset/0.75) # 0.75nm per bit
-        self._lens3.SetOLf(int(ideal_OLf + final_offset_bits))
-        print(f"Applied final offset of {final_offset} nm, for final defocus of {ideal_OLf + final_offset_bits:04X}")
-        _, _ = _scan_and_measure(acquisition_counter) # final used scan
+        # final_offset_bits = int(final_offset/0.75) # 0.75nm per bit
+        # self._lens3.SetOLf(int(ideal_OLf + final_offset_bits))
+        # print(f"Applied final offset of {final_offset} nm, for final defocus of {ideal_OLf + final_offset_bits:04X}")
+        # _, _ = _scan_and_measure(acquisition_counter) # final used scan

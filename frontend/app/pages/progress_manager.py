@@ -1,6 +1,23 @@
 from dash import html, dcc
 import dash_mantine_components as dmc
 
+def empty_drift_figure():
+    """helper to build base drift figure as needs to have the set options for the markers for the patch to keep
+    the figure consistent upon going to a different position/experiment"""
+    return {
+        "data": [
+            {"type": "scatter", "x": [], "y": [], "mode": "markers", "marker": {"color": "black", "size": 8}, "hoverinfo": "skip", "showlegend": False},
+            {"type": "scatter", "x": [], "y": [], "mode": "markers", "marker": {"color": "red", "size": 10}, "showlegend": False},
+        ],
+        "layout": {
+            "height": 400,
+            "width": 400,
+            "margin": {"l": 20, "r": 20, "t": 0, "b": 20},
+            "xaxis": {"visible": True, "autorange": False, "fixedrange": True, "range": [-256, 256]},
+            "yaxis": {"visible": True, "autorange": False, "fixedrange": True, "range": [256, -256]},
+        }
+    }
+
 def scan_progression():
     return dmc.Paper(
         withBorder=True,
@@ -30,19 +47,7 @@ def scan_progression():
                         dmc.Center(
                             dcc.Graph(
                             id='graph-overall-drift', 
-                            figure={
-                                "data": [
-                                    {"type": "scatter", "x": [], "y": [], "mode": "markers", "marker": {"color": "black", "size": 8}, "hoverinfo": "skip", "showlegend": False},
-                                    {"type": "scatter", "x": [], "y": [], "mode": "markers", "marker": {"color": "red", "size": 10}, "showlegend": False},
-                                ],
-                                "layout": {
-                                    "height": 400,
-                                    "width": 400,
-                                    "margin": {"l": 20, "r": 20, "t": 0, "b": 20},
-                                    "xaxis": {"visible": True, "autorange": False, "fixedrange": True, "range": [-256, 256]},
-                                    "yaxis": {"visible": True, "autorange": False, "fixedrange": True, "range": [-256, 256]},
-                                }
-                            }, 
+                            figure=empty_drift_figure(),
                             responsive=False, 
                             style={"height": "400px", "width": "400px"},
                             # config={ 'displayModeBar': False}

@@ -131,6 +131,10 @@ class SearchPipelineRequest(BaseModel):
     # SI options
     stemsi: STEMSISettings | None = None # None means no SI acquisition, otherwise will acquire with these settings
 
+class SearchPipelineBatchRequest(BaseModel):
+    folder_path: str        # experiment root folder (NOT a pos folder)
+    pos_order: list[int]    # ordered list of pos-xxx indices to run in given order
+
 class AnalysisRequest(BaseModel):
     folder_path: str
     box_indices: list[int]  # batch of one or more scan indices to analyse together
@@ -138,7 +142,12 @@ class AnalysisRequest(BaseModel):
 # Update microscope config
 class ConfigUpdateRequest(BaseModel):
     preferences: dict
-    stem4d_settings: dict | None = None
+    stem4d_settings: STEM4DSettings | None = None
+    stemsi_settings: STEMSISettings | None = None
+
+class ConnectRequest(BaseModel):
+    instrument_id: str
+    holder: str
 
 class CompUcentricCal(BaseModel):
     folder_path:str

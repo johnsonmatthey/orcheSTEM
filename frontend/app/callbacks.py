@@ -1,9 +1,10 @@
 import requests
 import os
 from pathlib import Path
-from dash import Input, Output, State, callback, no_update, ctx, Patch
+from dash import Input, Output, State, callback, no_update, ctx, Patch, ALL
 # Assuming these are your local helper modules
-from util import data_io, plotly_utils
+from util import data_io, plotly_utils, positions_io
+from util.logging_setup import set_experiment_log_target
 from dash.exceptions import PreventUpdate
 import plotly.express as px
 import plotly.graph_objects as go
@@ -11,26 +12,204 @@ from app import BACKEND_URL, BASE_LOCAL_PATH
 import math
 from pages.survey import FEATURE_REQUIREMENTS, _FEATURE_BOX_STYLE
 from pages.survey_image_segmentation import _SEGMENTATION_METHODS
+from pages.overview_manager import build_canvas_figure, build_position_rows, _STATUS_BADGE_COLOURS
+from pages.progress_manager import empty_drift_figure
+from pages.calibration_manager import build_connection_status
+import dash_mantine_components as dmc
 import glob
 
 # ONLY FOR FORCING FOR USE IN TESTS OFFLINE!
 TEST_IMAGING_METHOD = None #"qd_scanengine"#'gatan'
 TEST_LENSES_METHOD = None #'pyjem'
-TEST_STAGE_METHOD = None #'pyjem'
+TEST_STAGE_METHOD = None # 'pyjem'
 
-def get_latest_pos_index(folder_path):
-    """Find the highest pos-N directory index in folder_path, or 0 if none"""
-    if not os.path.isdir(folder_path):
-        return 0
-    valid_dir = glob.glob(os.path.join(folder_path, "pos-*"))
-    max_idx = max([int(os.path.basename(pos_val).split("-")[1]) for pos_val in valid_dir if os.path.isdir(pos_val)], default=0)
-    return max_idx
+def acquisition_method_str(pipeline_config):
+    """
+    helper for converting acquisition type in pipeline-config.json to string for frontend display
+    """
+    if not pipeline_config:
+        return None
+    methods = []
+    if pipeline_config.get("stem4d"):
+        methods.append("4D-STEM")
+    if pipeline_config.get("stemsi"):
+        methods.append("STEM SI")
+    return " + ".join(methods) if methods else "Survey only"
+
+def get_position_infos(folder_path):
+    """
+    per pos-X folder, build a row of table data in the given orderbased on acquisition, threshold, and pipeline states.
+    Grab these from the jsons. Order rows according to the position_scans.json
+    """
+    if not folder_path or not os.path.isdir(folder_path):
+        return []
+
+    meta = positions_io.load_positions_meta(folder_path)
+
+    pos_infos = []
+    for pos in meta["positions"]:
+        pos_index = pos["pos_index"]
+        pos_path = os.path.join(folder_path, f"pos-{pos_index}")
+        pipeline_config = data_io.local_retrieve(pos_path, "pipeline-config", data_type="json")
+        threshold_metadata = data_io.local_retrieve(pos_path, "threshold-metadata", data_type="json")
+
+        pos_infos.append({
+            "pos_index": pos_index,
+            "status": positions_io.get_position_status(folder_path, pos_index),
+            "threshold_method": (threshold_metadata or {}).get("selected_method"),
+            "acquisition_method": acquisition_method_str(pipeline_config),
+            "included": pos.get("included", True),
+            "stage_position": data_io.local_retrieve(pos_path, "stage-position", data_type="json"),
+        })
+    return pos_infos
+
+@callback(
+    Output("div-position-list", "children"),
+    Output("storage-positions-list-cache", "data"),
+    Output("graph-positions-overview", "figure"),
+    Input("experiment-state", "data"),
+    Input("stage-index-active", "data"),
+    Input("storage-state-pipeline", "data"),
+    Input("storage-positions-meta", "data"),
+    State("storage-folder-path", "data"),
+    State("storage-positions-list-cache", "data"),
+)
+def refresh_position_list(experiment_state, stage_index, pipeline_state, positions_meta, folder_path, cached_summaries):
+    """
+    Rebuild the list of positions when either positions change (positions_meta), pipeline changess (pipeline_state), 
+    experiment created (experiment_state) or new pos (stage-index-active)
+    """
+    pos_infos = get_position_infos(folder_path)
+    fig = build_canvas_figure(pos_infos, selected_pos_index=stage_index)
+    if pos_infos == cached_summaries: # just to prevent stage-index-active and _pipeline_state from retriggering the row rebuild too many times
+        # the position graph still needs to update just to show which new position is selected
+        return no_update, no_update, fig
+    return build_position_rows(pos_infos), pos_infos, fig
+
+
+@callback(
+    Output({"type": "badge-position-status", "index": ALL}, "children"),
+    Output({"type": "badge-position-status", "index": ALL}, "color"),
+    Output("interval-check-batch-progress", "disabled"),
+    Input("interval-check-batch-progress", "n_intervals"),
+    State("storage-folder-path", "data"),
+    State({"type": "badge-position-status", "index": ALL}, "id"),
+    prevent_initial_call=True,
+)
+def refresh_position_statuses(_n_intervals, folder_path, badge_ids):
+    """
+    Patches each badge's text/colour while a batch runs for progress updates. If done, stops interval
+    """
+    statuses = [positions_io.get_position_status(folder_path, b["index"]) for b in badge_ids]
+    any_running = "running" in statuses
+    colours = [_STATUS_BADGE_COLOURS.get(status, "gray") for status in statuses]
+
+    # need the _ check if 'not_configured' status or future ones in _STATUS_COLOURS etc. 
+    labels = [status.replace("_", " ") for status in statuses]
+    return labels, colours, not any_running
+
+
+@callback(
+    Output("storage-positions-included", "data"),
+    Input({"type": "checkbox-position-include", "index": ALL}, "checked"),
+    State("storage-folder-path", "data"),
+    prevent_initial_call=True,
+)
+def toggle_position_included(checked_list, folder_path):
+    """
+    storing in the json whether to include. NOTE using different store as otherwise will trigger infinite loop
+    Caused by the meta store triggering the rebuilding of the pos table which then triggers this again etc.
+    """
+    if not folder_path or not ctx.triggered:
+        raise PreventUpdate
+    pos_index = ctx.triggered_id["index"]
+    included = ctx.triggered[0]["value"]
+    # print("here many times: ", ctx.triggered)
+
+    meta = positions_io.load_positions_meta(folder_path)
+    current = next((p["included"] for p in meta["positions"] if p["pos_index"] == pos_index), None)
+    if current == included:
+        raise PreventUpdate
+    # store in json
+    positions_io.set_position_included(folder_path, pos_index, included)
+    return included
+
+
+@callback(
+    Output("storage-positions-meta", "data", allow_duplicate=True),
+    Input({"type": "btn-position-up", "index": ALL}, "n_clicks"),
+    Input({"type": "btn-position-down", "index": ALL}, "n_clicks"),
+    State("storage-folder-path", "data"),
+    prevent_initial_call=True,
+)
+def reorder_position(up_clicks, down_clicks, folder_path):
+    """
+    update orderings based on pressing up or down and store in position_scans.json
+    """
+    if not folder_path or not ctx.triggered or not ctx.triggered[0]["value"]:
+        raise PreventUpdate
+    pos_index = ctx.triggered_id["index"]
+    direction = -1 if ctx.triggered_id["type"] == "btn-position-up" else 1
+    return positions_io.move_position(folder_path, pos_index, direction)
+
+@callback(
+    Output('stage-index-active', 'data', allow_duplicate=True),
+    Input('button-new-position', 'n_clicks'),
+    State('storage-folder-path', 'data'),
+    State("dropdown-control-stage", "value"),
+    State("dropdown-control-lenses", "value"),
+    State("dropdown-control-imaging", "value"),
+    prevent_initial_call=True,
+)
+def create_new_position(n_clicks, folder_path, stage_method, lenses_method, imaging_method):
+    """
+    create a new pos-x folder at the stage's current location. NOTE does not scan, but will grab stage location for now
+    TODO remove stage grab if it will be done in the scan too anyway? Timewise, it is inconsequential
+    """
+    if not n_clicks or not folder_path:
+        raise PreventUpdate
+    #make the pos folder
+    max_idx = positions_io.get_latest_pos_index(folder_path)
+    new_index = max_idx + 1
+    pos_path = os.path.join(folder_path, f"pos-{new_index}")
+    Path(pos_path).mkdir(parents=True, exist_ok=True)
+    Path(pos_path, 'scans').mkdir(parents=True, exist_ok=True)
+    Path(pos_path, 'drift_survey').mkdir(parents=True, exist_ok=True)
+    # grab and store stage position
+    requests.post(f"{BACKEND_URL}/survey/stage-position", json={
+        "folder_path": pos_path,
+        "stage_index": new_index,
+        "stage_method": stage_method if TEST_STAGE_METHOD is None else TEST_STAGE_METHOD,
+        "lenses_method": lenses_method if TEST_LENSES_METHOD is None else TEST_LENSES_METHOD,
+        "imaging_method": imaging_method if TEST_IMAGING_METHOD is None else TEST_IMAGING_METHOD
+    })
+    return new_index
+
+@callback(
+    Output('stage-index-active', 'data', allow_duplicate=True),
+    Output('tab-pos-display', 'value', allow_duplicate=True),
+    Input({"type": "btn-position-open", "index": ALL}, "n_clicks"),
+    State("storage-folder-path", "data"),
+    prevent_initial_call=True,
+)
+def open_position(_n_clicks_list, folder_path):
+    """switch the app's working position to the one whose 'Open' button was clicked.
+    jump to Progress if a batch acquisition is currently running for it, otherwise Scan"""
+    # NOTE inputs also fire when the row set is remade, so only react to a real click
+    if not ctx.triggered or not ctx.triggered[0]["value"]:
+        raise PreventUpdate
+    pos_index = ctx.triggered_id["index"]
+    status = positions_io.get_position_status(folder_path, pos_index) if folder_path else None
+    target_tab = "progress" if status in ["running", 'done'] else "scan"
+    return pos_index, target_tab
+
+
 
 @callback(
     Output("storage-folder-path",'data'),
     Output('experiment-state','data'),
     Output("text-input-experiment-name", "disabled"),
-    Output("stage-index-counter", "data", allow_duplicate=True),
+    Output("stage-index-active", "data", allow_duplicate=True),
     Output("storage-state-pipeline", "data", allow_duplicate=True),
     Input("button-create-experiment", "n_clicks"),
     Input('url-home','pathname'),
@@ -43,12 +222,16 @@ def create_experiment_and_check_initial_state(n_click, url_pathname, folder_name
     folder_path = os.path.join(BASE_LOCAL_PATH, folder_name)
     if ctx.triggered_id == 'button-create-experiment':
         requests.post(f"{BACKEND_URL}/create-experiment", json={"folder_path": folder_path})
+        set_experiment_log_target(folder_path)
         return folder_path, False, True, 0, no_update
     if url_pathname == '/':
         experiment_state = os.path.isdir(folder_path)
         # If experiment exists, get the last pos index and use that to determine pipeline state
         if experiment_state:
-            latest_idx = get_latest_pos_index(folder_path)
+            # create experiment again, which will instead only reattach experiment log after a restart for backend
+            requests.post(f"{BACKEND_URL}/create-experiment", json={"folder_path": folder_path})
+            set_experiment_log_target(folder_path) # reattach for frontend now 
+            latest_idx = positions_io.get_latest_pos_index(folder_path)
             # Detect pipeline state from the latest position folder
             pos_path = os.path.join(folder_path, f"pos-{latest_idx}")
             acq_state = data_io.local_retrieve(pos_path, "long-acquisition-state", data_type='json')
@@ -61,27 +244,6 @@ def create_experiment_and_check_initial_state(n_click, url_pathname, folder_name
         return folder_path, experiment_state, False, 0, no_update
     raise PreventUpdate
 
-# button options to change the directory we are working in
-@callback(
-    Output('tab-main-display','value'),
-    Input('button-scan', 'n_clicks'),
-    Input('button-threshold', 'n_clicks'),
-    Input('button-cluster', 'n_clicks'),
-    Input('button-search', 'n_clicks'),
-    prevent_initial_call=True
-)
-def switch_tabs(n1, n2, n3, n4):
-    button_id = ctx.triggered_id
-    if button_id is not None:
-        tab_map = {
-            'button-scan': 'survey-image',
-            'button-threshold': 'survey-image-segmentation',
-            'button-cluster': 'cluster-manager',
-            'button-search': 'progress-checker'
-        }
-        return tab_map[button_id]
-    else:
-        raise PreventUpdate
     
 @callback(
     Output("dropdown-control-stage", "data"),
@@ -95,8 +257,9 @@ def switch_tabs(n1, n2, n3, n4):
     Output("dropdown-control-si-detector", "data"),
     Output("dropdown-control-si-detector", "value"),
     Input("button-create-experiment", "n_clicks"),
+    Input("store-microscope-session", "data"), # changes once a connect has finished, so the available methods are refreshed
 )
-def populate_microscope_dropdowns(_):
+def populate_microscope_dropdowns(n_button, session_store):
     # This will trigger on frontend loading. Also added a second trigger on if the experiment is created
     # No prevent update here on purpose
     try:
@@ -119,6 +282,50 @@ def populate_microscope_dropdowns(_):
     except Exception as e:
         print("Error retrieving microscope status:", e)
         return [], None, [], None, [], None, [], None, [], None
+
+@callback(
+    Output("dropdown-instrument", "data"),
+    Output("dropdown-instrument", "value"),
+    Output("store-microscope-session", "data"),
+    Output("div-connection-status", "children"),
+    Input("button-calibration-connect", "n_clicks"),
+    State("dropdown-instrument", "value"),
+    State("dropdown-holder", "value"),
+    running=[(Output("button-calibration-connect", "disabled"), True, False)], # blocks repeat clicks while a connect is in progress
+)
+def load_or_connect_microscope(n_clicks, instrument_id, holder):
+    """On page load show the backend's active instrument; on button press switch to the chosen instrument and holder and report each connection."""
+    try:
+        if ctx.triggered_id == "button-calibration-connect":
+            resp = requests.post(f"{BACKEND_URL}/microscope/connect", json={"instrument_id": instrument_id, "holder": holder})
+        else:
+            resp = requests.get(f"{BACKEND_URL}/microscope/session")
+        if not resp.ok:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except ValueError:
+                detail = resp.text
+            return no_update, no_update, no_update, dmc.Alert(str(detail), color="red", title="Could not connect")
+        session = resp.json()
+    except Exception as e:
+        return no_update, no_update, no_update, dmc.Alert(str(e), color="red", title="Backend unreachable")
+    instruments = [{"value": i["value"], "label": i["label"]} for i in session["instruments"]]
+    return instruments, session["instrument"], session, build_connection_status(session)
+
+@callback(
+    Output("dropdown-holder", "data"),
+    Output("dropdown-holder", "value"),
+    Input("dropdown-instrument", "value"),
+    Input("store-microscope-session", "data"),
+)
+def update_holder_options(instrument_id, session):
+    """Holders follow the selected instrument; the connected instrument keeps its connected holder, others start at their first."""
+    if not instrument_id or not session:
+        return [], None
+    holders = next((i["holders"] for i in session["instruments"] if i["value"] == instrument_id), [])
+    if instrument_id == session["instrument"] and session["holder"] in holders:
+        return holders, session["holder"]
+    return holders, (holders[0] if holders else None)
 
 @callback(
     Output("collapse-advanced-settings", "opened"),
@@ -219,11 +426,12 @@ def snap_drift_region_size_ui(value, survey_image_size):
 
 @callback(
     Output('graph-survey', 'figure', allow_duplicate=True),
-    Output('stage-index-counter', 'data', allow_duplicate=True),
+    Output('storage-drift-region-box-coords', 'data', allow_duplicate=True),
+    Output('image-survey-driftregion', 'src', allow_duplicate=True),
     Input('button-scan', 'n_clicks'),
     Input('experiment-state', 'data'), # This triggers on page load when state is set
+    Input('stage-index-active', 'data'), # Reload/clear when the open position changes
     State('storage-folder-path', 'data'),
-    State('stage-index-counter', 'data'),
     State("input-survey-image-size", "value"),
     State("input-survey-dwell-time", "value"),
     State("input-survey-flyback-time", "value"),
@@ -232,28 +440,20 @@ def snap_drift_region_size_ui(value, survey_image_size):
     State("dropdown-control-imaging", "value"),
     prevent_initial_call=True
 )
-def scan(n_click, experiment_state, folder_path, current_index, survey_image_size, survey_dwell_time, survey_flyback_time, stage_method, lenses_method, imaging_method):
+def scan(n_click, experiment_state, current_index, folder_path, survey_image_size, survey_dwell_time, survey_flyback_time, stage_method, lenses_method, imaging_method):
     if not folder_path:
         raise PreventUpdate
     
     triggered = ctx.triggered_id
     idx = current_index if current_index is not None else 0
+    pos_path = os.path.join(folder_path, f"pos-{idx}")
 
-    # CASE A: User clicked the scan button
+    # User clicked the scan button - scan the currently open position and DONT make a new one as before
     if triggered == 'button-scan':
-        new_index = idx + 1
-        pos_path = os.path.join(folder_path, f"pos-{new_index}")
-        # Creates new folder for the new position/stage etc. For now assume you want only most recent scan but can iterate through later
-        # Also create subfolders for organisation
-        Path(pos_path).mkdir(parents=True, exist_ok=True)
-        Path(pos_path, 'scans').mkdir(parents=True, exist_ok=True)
-        Path(pos_path, 'drift_survey').mkdir(parents=True, exist_ok=True)
-        Path(pos_path, 'logs').mkdir(parents=True, exist_ok=True)
-
         requests.post(f"{BACKEND_URL}/survey/scan", json={
             "folder_path": pos_path, 
             "filename": f"survey",
-            "survey_image_size": survey_image_size, # refers to the original survey size. Needed for subscanning
+            "survey_image_size": survey_image_size, # refers to the original survey size. Needed for subscanning for some hardware
             "dwell_time_us": survey_dwell_time,
             "flyback_time_us": survey_flyback_time,
             "is_subscan": False,
@@ -262,36 +462,53 @@ def scan(n_click, experiment_state, folder_path, current_index, survey_image_siz
             "lenses_method": lenses_method if TEST_LENSES_METHOD is None else TEST_LENSES_METHOD, # lenses_method
             "imaging_method": imaging_method if TEST_IMAGING_METHOD is None else TEST_IMAGING_METHOD # imaging_method
         })
-        
+        # update the position just in case as well as could have moved location
         requests.post(f"{BACKEND_URL}/survey/stage-position", json={
             "folder_path": pos_path, 
-            "stage_index": new_index,
+            "stage_index": idx,
             "stage_method": stage_method if TEST_STAGE_METHOD is None else TEST_STAGE_METHOD, # stage_method
             "lenses_method": lenses_method if TEST_LENSES_METHOD is None else TEST_LENSES_METHOD, # lenses_method
             "imaging_method": imaging_method if TEST_IMAGING_METHOD is None else TEST_IMAGING_METHOD # imaging_method
 
         })
-
-
         image = data_io.local_retrieve(pos_path, f"survey", data_type='png')
         if image is not None:
             fig = px.imshow(image, binary_string=True)
             fig.update_layout(height=800, width=800, margin=dict(l=0, r=0, b=0, t=0), dragmode=False, xaxis={'visible': False, 'fixedrange': True}, yaxis={'visible': False, 'fixedrange': True})
-            return fig, new_index # NOTE no need to increment it in the future as it is returned incremented
+            return fig, no_update, no_update
         
-        return no_update, new_index
+        return no_update, no_update, no_update
 
-    # CASE B: Initial Load / Experiment State changed
-    # We only auto-load if the button WASN'T the trigger
-    if experiment_state is True:
-        pos_path = os.path.join(folder_path, f"pos-{idx}")
+    # Initial Load / Experiment State changed / Position switched - just retrieve and display
+    if experiment_state is True or triggered == "stage-index-active":
         image = data_io.local_retrieve(pos_path, "survey", data_type='png')
         if image is not None:
             fig = px.imshow(image, binary_string=True)
             # shapes = [plotly_utils.skimage_to_plotly_shape(b['bbox'], b['id']) for b in bboxes]
             fig.update_layout(height=800, width=800, margin=dict(l=0, r=0, b=0, t=0), dragmode=False, xaxis={'visible': False, 'fixedrange': True}, yaxis={'visible': False, 'fixedrange': True})
 
-            return fig, idx
+            #restore the previously-acquired drift region box for this position if exists too
+            drift_region = data_io.local_retrieve(os.path.join(pos_path, 'drift_survey'), "drift-region", data_type='json')
+            box_coords = drift_region.get("box_coords") if drift_region else None
+            drift_src = None
+            if box_coords:
+                fig.update_layout(shapes=[{
+                    "type": "rect",
+                    "x0": box_coords[2],
+                    "y0": box_coords[3],
+                    "x1": box_coords[0] + box_coords[2],
+                    "y1": box_coords[1] + box_coords[3],
+                    "line": {"color": "red", "width": 2},
+                }])
+                drift_image = data_io.local_retrieve(os.path.join(pos_path, "drift_survey"), "drift_survey-0", data_type='png')
+                if drift_image is not None:
+                    drift_src = data_io.array_to_data_url_cv2(drift_image)
+
+            return fig, box_coords, drift_src
+
+        # New position is opened so clear old survey/drift visuals from the previous position ready for new scans
+        if triggered == "stage-index-active":
+            return go.Figure(), None, None  
 
     raise PreventUpdate
 
@@ -317,10 +534,10 @@ def snap_drift_region_box(survey_size, region_box):
     State("radiocard-group-drift-correction-method", "value"),
     State("input-drift-region-size", "value"),
     State("graph-survey", "figure"),
-    State('stage-index-counter', 'data'),
+    # State('stage-index-active', 'data'),
     prevent_initial_call=True,
 )
-def place_drift_box(click_data, method, region_size, current_fig, current_index):
+def place_drift_box(click_data, method, region_size, current_fig):
     if method != "Box Region" or click_data is None or current_fig is None:
         raise PreventUpdate
 
@@ -365,7 +582,7 @@ def place_drift_box(click_data, method, region_size, current_fig, current_index)
     State("input-drift-dwell-time", "value"),
     State("input-drift-flyback-time", "value"),
     State('storage-folder-path', 'data'),
-    State('stage-index-counter', 'data'),
+    State('stage-index-active', 'data'),
     # State("input-survey-image-size", "value"),
     State("dropdown-control-stage", "value"),
     State("dropdown-control-lenses", "value"),
@@ -436,6 +653,9 @@ def acquire_drift_region(n_clicks, current_fig, method, drift_dwell_time, drift_
             "imaging_method": imaging_method if TEST_IMAGING_METHOD is None else TEST_IMAGING_METHOD,
         })
 
+    #Store box coords for reloading (becomes unneccesary after pipeline) - this is just for replotting if not configured properly before then
+    data_io.local_store(os.path.join(pos_path, 'drift_survey'), 'drift-region', data={"box_coords": box_coords, "method": method}, data_type='json')
+
     # When complete, change box border to red to indicate acquisition is done
     patch = Patch()
     patch["layout"]["shapes"] = [ # convert back to x0,y0,x1,y1 format for plotting
@@ -469,7 +689,7 @@ def toggle_method_panels(value):
 
 @callback(
     Output("image-survey-segmentation", "src"),
-    Input("button-threshold", "n_clicks"),
+    # Input("button-threshold", "n_clicks"),
     Input('experiment-state', 'data'),
     # For Classical
     Input("slider-median-filter-classical", "value"),
@@ -501,12 +721,13 @@ def toggle_method_panels(value):
     #Input("hw-ratio-selector", "value"),
     # State info needed for pathing 
     State('storage-folder-path', 'data'),
-    State('stage-index-counter', 'data'),
+    Input('stage-index-active', 'data'),
     State("segment-segcontrol-method", "value"),
     prevent_initial_call=True,
 )
 def run_segmentation(
-    n, experiment_state, 
+    # n, 
+    experiment_state, 
     # Classical params
     median_val_classical, 
     # ML params
@@ -527,12 +748,14 @@ def run_segmentation(
     pos_path = os.path.join(folder_path, f"pos-{current_index}")
 
     triggered = ctx.triggered_id
-    # First check if experiment already exists, load if so for visual reasons
-    if experiment_state is True:
+    # print(triggered, experiment_state)
+    # check experiment state trigger and if experiment state is true -> means refresh. Otherwise change when index changes
+    if (triggered == "experiment-state" and experiment_state is True) or triggered == "stage-index-active":
         overlay_image = data_io.local_retrieve(pos_path, "threshold-overlay", "object")
         if overlay_image is not None:
             return data_io.array_to_data_url_cv2(overlay_image)
-    
+        if triggered == "stage-index-active":
+            return None  # clear stale overlay from the previous position
     # Now check which method is being used and group up the triggers
     payloads = {
         "Classical": {
@@ -588,7 +811,7 @@ def run_segmentation(
     Output("graph-survey-image-clustering", "figure"),
     Output("storage-original-boxes", "data"),
     Output("storage-bounding-boxes", "data"),
-    Input("tab-main-display", "value"),           # <--- Add the Tab Input
+    Input("tab-pos-display", "value"),
     Input("button-cluster", "n_clicks"),
     Input("btn-reset-boxes", "n_clicks"),
     Input("experiment-state", "data"),
@@ -600,10 +823,10 @@ def run_segmentation(
     State('input-sampling', "value"),
     State("input-survey-image-size", "value"),
     State("input-full-image-size", "value"),
-    State('stage-index-counter', 'data'),
+    Input('stage-index-active', 'data'),
     prevent_initial_call=True 
 )
-def watershed_and_interaction_manager(tab_value, n_cluster, n_reset, exp_state, relayout_data, 
+def watershed_and_interaction_manager(pos_tab_value, n_cluster, n_reset, exp_state, relayout_data, 
                                       s_val, folder_path, original_bboxes, current_filtered,
                                       sampling, survey_size, full_size, 
                                       current_index):
@@ -613,10 +836,9 @@ def watershed_and_interaction_manager(tab_value, n_cluster, n_reset, exp_state, 
     pos_path = os.path.join(folder_path, f"pos-{current_index}")
 
     triggered = ctx.triggered_id
-
-    # --- 1. RUN NEW WATERSHED (Manual Click) ---
+    # print('cluster trigger:' , triggered)
+    # Cluster button pressed, apply watershed, cluster, and then display
     if triggered == "button-cluster":
-        # ... (Your existing watershed logic remains same)
         requests.post(f"{BACKEND_URL}/cluster/watershed", json={
             "folder_path": pos_path, "s_value": s_val, "sampling_res": sampling,
             'survey_image_size': survey_size, 'full_image_size': full_size
@@ -627,44 +849,55 @@ def watershed_and_interaction_manager(tab_value, n_cluster, n_reset, exp_state, 
 
         fig = px.imshow(image, binary_string=True)
         shapes = [plotly_utils.skimage_to_plotly_shape(b['bbox'], b['id']) for b in bboxes]
-        fig.update_layout(height=800, width=800, margin=dict(l=0, r=0, b=0, t=0), shapes=shapes, dragmode='drawrect', newshape=dict(line_color='cyan'))
+        fig.update_layout(height=800, width=800, margin=dict(l=0, r=0, b=0, t=0), shapes=shapes, dragmode='drawclosedpath', newshape=dict(line_color='cyan'))
         return fig, bboxes, bboxes
 
-    # --- 2. AUTO-LOAD (Tab Switch or Page Load) ---
-    # We trigger if we switched to the cluster tab OR the experiment state changed
-    if (triggered == "tab-main-display" and tab_value == "cluster-manager") or \
-       (triggered == "experiment-state" and exp_state is True):
-        
+    # We trigger if we switched to the cluster tab, the experiment state changed, or the open position changed
+    if (triggered == "tab-pos-display" and pos_tab_value == "cluster") or \
+       (triggered == "experiment-state" and exp_state is True) or \
+       triggered == "stage-index-active":
         saved_coords = data_io.local_retrieve(pos_path, 'coords', data_type='json')
         image = data_io.local_retrieve(pos_path, 'survey', data_type='png')
-        
+
+        # Position has cluster data, display
         if image is not None and saved_coords is not None:
             fig = px.imshow(image, binary_string=True)
             shapes = [plotly_utils.skimage_to_plotly_shape(b['bbox'], b['id']) for b in saved_coords]
-            fig.update_layout(height=800, width=800, margin=dict(l=0, r=0, b=0, t=0), shapes=shapes, dragmode='drawrect', newshape=dict(line_color='cyan'))
+            # print(len(shapes))
+            fig.update_layout(height=800, width=800, margin=dict(l=0, r=0, b=0, t=0), shapes=shapes, dragmode='drawclosedpath', newshape=dict(line_color='cyan'))
             return fig, saved_coords, saved_coords
 
-    # --- 3. RESET BOXES ---
+        #Position switched but has no cluster saved yet - clear old figure/boxes from the previously open position
+        if triggered == "stage-index-active":
+            fig = go.Figure()
+            if image is not None:
+                fig = px.imshow(image, binary_string=True)
+                fig.update_layout(height=800, width=800, margin=dict(l=0, r=0, b=0, t=0), dragmode='drawclosedpath')
+            return fig, None, None
+        
+
+    # Reset the boxes that were selected, showing all now
     if triggered == "btn-reset-boxes":
-        # ... (Existing logic)
         if not original_bboxes: return no_update, no_update, no_update
+
         image = data_io.local_retrieve(pos_path, 'survey', data_type='png')
         fig = px.imshow(image, binary_string=True)
         shapes = [plotly_utils.skimage_to_plotly_shape(b['bbox'], b['id']) for b in original_bboxes]
-        fig.update_layout(height=800, width=800, margin=dict(l=0, r=0, b=0, t=0), shapes=shapes, dragmode='drawrect')
+        fig.update_layout(height=800, width=800, margin=dict(l=0, r=0, b=0, t=0), shapes=shapes, dragmode='drawclosedpath')
         return fig, no_update, original_bboxes
 
-    # --- 4. ROI FILTERING (Using Patch) ---
+    # based on the dragged lasso, only include boxes whose centroids lie within
     if triggered == "graph-survey-image-clustering" and relayout_data:
-        # Note: Patch ONLY works if the graph already exists. 
-        # Since we load the full figure in Step 2, Patch will now work here.
         if 'shapes' in relayout_data and len(relayout_data['shapes']) > 0:
             latest_shape = relayout_data['shapes'][-1]
-            roi_bbox = plotly_utils.plotly_shape_to_skimage(latest_shape)
+            if latest_shape.get('type') == 'path':
+                roi = plotly_utils.plotly_path_to_polygon(latest_shape)
+            else:
+                roi = plotly_utils.plotly_shape_to_skimage(latest_shape)
             source = original_bboxes if original_bboxes else current_filtered
             if not source: raise PreventUpdate
 
-            filtered = [b for b in source if plotly_utils.is_inside(b['centroid'], roi_bbox)]
+            filtered = [b for b in source if plotly_utils.is_inside(b['centroid'], roi)]
             data_io.local_store(pos_path, 'coords', data=filtered, data_type='json')
             
             patch_fig = Patch()
@@ -675,8 +908,18 @@ def watershed_and_interaction_manager(tab_value, n_cluster, n_reset, exp_state, 
 
 
 @callback(
+    Output("button-store-pipe", "disabled"),
+    Input("storage-bounding-boxes", "data"),
+)
+def toggle_search_button(bounding_boxes):
+    "Wait until cluster boxes exists before allowed to store"
+    return not bounding_boxes
+
+
+@callback(
     Output('storage-state-pipeline','data', allow_duplicate=True),# Note interval is located in pages/progress_manager.py
-    Input("button-search","n_clicks"),
+    Output("tab-main-display", "value", allow_duplicate=True),
+    Input("button-store-pipe","n_clicks"),
     State("storage-folder-path","data"),
     Input("input-sampling","value"),
     Input("input-focus-freq","value"),
@@ -707,7 +950,7 @@ def watershed_and_interaction_manager(tab_value, n_cluster, n_reset, exp_state, 
     # analysis states
     State("checkbox-enable-autoptych", "checked"),
     # Other states
-    State('stage-index-counter', 'data'),
+    State('stage-index-active', 'data'),
     State("input-drift-dwell-time", "value"),
     State("input-drift-flyback-time", "value"),
     State("storage-drift-region-box-coords", "data"),
@@ -715,7 +958,7 @@ def watershed_and_interaction_manager(tab_value, n_cluster, n_reset, exp_state, 
     State("input-survey-flyback-time", "value"),
     prevent_initial_call=True
 )
-def start_search(
+def store_pipeline_configuration(
     n_click, folder_path, sampling, n_focus, n_drift, survey_image_size, full_image_size,
     ctrl_stage, ctrl_lenses, ctrl_imaging,
     enable_4dstem, ctrl_4dstem, stem4d_savepath, stem4d_dwell_time_us, stem4d_flyback_time_us, stem4d_bitdepth,
@@ -742,15 +985,16 @@ def start_search(
             }
             if enable_4dstem:
                 config_preferences["stem4d_settings"] = {
-                    "save_path": stem4d_savepath,
+                    "savepath": stem4d_savepath,
                     "dwell_time_us": stem4d_dwell_time_us,
                     "flyback_time_us": stem4d_flyback_time_us,
-                    "bit_depth": stem4d_bitdepth,
+                    "bitdepth": stem4d_bitdepth,
                 }
             if enable_si:
                 config_preferences["stemsi_settings"] = {
                     "enable_eels": enable_si_eels,
                     "enable_eds": enable_si_eds,
+                    "enable_custom": enable_si_custom,
                     "dwell_time_us": si_dwell_time,
                     "flyback_time_us": si_flyback_time,
                     "subscan_size": si_subscan,
@@ -760,56 +1004,86 @@ def start_search(
             requests.post(f"{BACKEND_URL}/microscope/config", json=config_preferences)
             print("Updated microscope configuration with current user preferences.")
 
-            requests.post( 
-                f"{BACKEND_URL}/pipeline/search-pipeline",
-                json={
-                    'folder_path':pos_path,
-                    'sampling':sampling, # sampling res - not really needed as known via box coords
-                    'survey_image_size':survey_image_size,
-                    'scan_dwell_time_us': survey_dwell_time, # temp for now as fallback if only HAADF
-                    'scan_flyback_time_us': survey_flyback_time,
+            # store this as a json for the backend to read once everything is ready
+            pipeline_config={
+                'folder_path':pos_path,
+                'sampling':sampling, # sampling res - not really needed as known via box coords
+                'survey_image_size':survey_image_size,
+                'scan_dwell_time_us': survey_dwell_time, # temp for now as fallback if only HAADF
+                'scan_flyback_time_us': survey_flyback_time,
 
-                    'full_image_size':full_image_size,
-                    "stage_method": ctrl_stage if TEST_STAGE_METHOD is None else TEST_STAGE_METHOD, 
-                    "lenses_method": ctrl_lenses if TEST_LENSES_METHOD is None else TEST_LENSES_METHOD,
-                    "imaging_method": ctrl_imaging if TEST_IMAGING_METHOD is None else TEST_IMAGING_METHOD,
-                    "analysis_method" : "autoptych" if enable_autoptych else 'manual', # placeholder for now, can add more options later
-                    "drift" : {
-                        'drift_every':n_drift,
-                        'dwell_time_us': drift_dwell_time_us,
-                        'flyback_time_us': drift_flyback_time_us,
-                        'box_coords': drift_box_coords, # for now just pass None and do full image drift correction. Can add option for box region later
-                        'window_type': "hanning",
-                        'max_shift_pixel': None, # None means auto which is half the survey size
-                    },
-                    "focus": {
-                        "focus_every": n_focus,
-                        "focus_method": "custom", # options are "pyjem" or "custom" - pyjem only if pyjem lens control available
-                        "focus_region": "box", # options are "full" or "box"
-                    },
-                    "stem4d": {
-                        "savepath": stem4d_savepath,
-                        "dwell_time_us": stem4d_dwell_time_us,
-                        "flyback_time_us": stem4d_flyback_time_us,
-                        "bitdepth": stem4d_bitdepth,
-                    } if enable_4dstem else None,
-                    "stemsi": {
-                        "detector": ctrl_si,
-                        "enable_eels": enable_si_eels,
-                        "enable_eds": enable_si_eds,
-                        "enable_custom": enable_si_custom,
-                        "dwell_time_us": si_dwell_time,
-                        "flyback_time_us": si_flyback_time,
-                        "subscan_size": si_subscan,
-                        "passes": si_passes,
-                    } if enable_si else None
-                }
-            )
-            return "started"
+                'full_image_size':full_image_size,
+                "stage_method": ctrl_stage if TEST_STAGE_METHOD is None else TEST_STAGE_METHOD, 
+                "lenses_method": ctrl_lenses if TEST_LENSES_METHOD is None else TEST_LENSES_METHOD,
+                "imaging_method": ctrl_imaging if TEST_IMAGING_METHOD is None else TEST_IMAGING_METHOD,
+                "analysis_method" : "autoptych" if enable_autoptych else 'manual', # placeholder for now, can add more options later
+                "drift" : {
+                    'drift_every':n_drift,
+                    'dwell_time_us': drift_dwell_time_us,
+                    'flyback_time_us': drift_flyback_time_us,
+                    'box_coords': drift_box_coords,
+                    'window_type': "hanning",
+                    'max_shift_pixel': None, # None means auto which is half the survey size
+                },
+                "focus": {
+                    "focus_every": n_focus,
+                    "focus_method": "custom", # options are "pyjem" or "custom" - pyjem only if pyjem lens control available
+                    "focus_region": "box", # options are "full" or "box"
+                },
+                "stem4d": {
+                    "savepath": stem4d_savepath,
+                    "dwell_time_us": stem4d_dwell_time_us,
+                    "flyback_time_us": stem4d_flyback_time_us,
+                    "bitdepth": stem4d_bitdepth,
+                } if enable_4dstem else None,
+                "stemsi": {
+                    "detector": ctrl_si,
+                    "enable_eels": enable_si_eels,
+                    "enable_eds": enable_si_eds,
+                    "enable_custom": enable_si_custom,
+                    "dwell_time_us": si_dwell_time,
+                    "flyback_time_us": si_flyback_time,
+                    "subscan_size": si_subscan,
+                    "passes": si_passes,
+                } if enable_si else None
+            }
+            # )
+            print("pipeline stored in:", pos_path)
+            data_io.local_store(pos_path, 'pipeline-config', data=pipeline_config, data_type='json')
+
+            return "started", "overview" 
         else:
             raise PreventUpdate
     else:
         raise PreventUpdate
+
+@callback(
+    Output("text-batch-status", "children"),
+    Output("interval-check-batch-progress", "disabled", allow_duplicate=True),
+    Input("button-begin-all", "n_clicks"),
+    State("storage-folder-path", "data"),
+    prevent_initial_call=True,
+)
+def begin_all_positions(n_click, folder_path):
+    """
+    This is where the overall serach now begins!
+    """
+    if not n_click or not folder_path:
+        raise PreventUpdate
+
+    pos_meta = positions_io.load_positions_meta(folder_path)
+    pos_order = [
+        pos["pos_index"] for pos in pos_meta["positions"]
+        if pos.get("included", True) and positions_io.get_position_status(folder_path, pos["pos_index"]) == "ready"
+    ]
+    if not pos_order:
+        return "No 'ready' positions ticked to run - configure and save at least one position first.", no_update
+
+    requests.post(f"{BACKEND_URL}/pipeline/search-pipeline-batch", json={
+        "folder_path": folder_path,
+        "pos_order": pos_order,
+    })
+    return f"Started: running positions {pos_order} in order.", False #start the interval checks for batch progress
 
 @callback(
     Output('graph-survey-progress', 'figure'),
@@ -820,30 +1094,36 @@ def start_search(
     Output('storage-state-pipeline', 'data', allow_duplicate=True),
     Output('graph-overall-drift', 'figure'),
     Input('interval-check-progress', 'n_intervals'),
+    Input('stage-index-active', 'data'), # Reload/clear when the open position changes
     State('storage-state-pipeline', 'data'),
     State('storage-folder-path', 'data'),
     State("storage-bounding-boxes", "data"), 
-    State('stage-index-counter', 'data'),
     State('graph-overall-drift', 'figure'),
     prevent_initial_call=True
 )
-def check_progress(n_interval, pipeline_state, folder_path, original_bboxes, current_index, current_drift_fig):
+def check_progress(n_interval, current_index, pipeline_state, folder_path, original_bboxes, current_drift_fig):
     if not folder_path:
         raise PreventUpdate
     pos_path = os.path.join(folder_path, f"pos-{current_index}")
+    triggered = ctx.triggered_id
+    switched_position = triggered == "stage-index-active"
 
-    # If bboxes aren't in the store yet (e.g. after page reload), try loading from disk
-    if not original_bboxes:
+    # If bboxes aren't in the store yet (e.g. after page reload or a position switch), try loading from disk
+    if switched_position or not original_bboxes:
         original_bboxes = data_io.local_retrieve(pos_path, "coords", data_type='json')
         if not original_bboxes:
+            if switched_position:
+                # No scan data for this position yet - clear old visuals from the previous one
+                return go.Figure(), "0", "Not started", None, None, no_update, empty_drift_figure()
             raise PreventUpdate
     zfill_len = len(str(len(original_bboxes)))
     # 1. Check current acquisition status
+    # If the file hasn't been created yet, the pipeline is still initialising
     acq_state = data_io.local_retrieve(pos_path, "long-acquisition-state", data_type='json')
-    
-    # If the file hasn't been created yet, the pipeline is still initializing
     if acq_state is None:
-        return no_update, str(0), "Initializing...", no_update, no_update, "started", no_update
+        if switched_position:
+            return go.Figure(), "0", "Not started", None, None, no_update, empty_drift_figure()
+        return no_update, str(0), "Initialising...", no_update, no_update, "started", no_update
 
     # 2. Retrieve Progress Data
     # box_index = data_io.local_retrieve(pos_path, "box-index", data_type='object')
@@ -853,18 +1133,21 @@ def check_progress(n_interval, pipeline_state, folder_path, original_bboxes, cur
     survey_image_size = progress_metadata.get("survey_image_size") if progress_metadata else 512  # Default to 512 if not available
     idx = progress_metadata.get("box_index") if progress_metadata else 0  # Use metadata if available
 
-    # 3 drift scatter updated via Patch
+    # 3 drift scatter - rebuilt fully on position switch, patched per iteration otherwise
     drift_fig = Patch()
     if overall_drift:
-        existing_x = (current_drift_fig or {}).get("data", [{}])[0].get("x") or []
-        if not existing_x and os.path.exists(os.path.join(pos_path, "scan-results.json")):
-            # rebuild full history from scan-results as refreshed page lost it
+        existing_traces = (current_drift_fig or {}).get("data") or []
+        existing_x = (existing_traces[0].get("x") if existing_traces else None) or [] # check if existing x values
+        # check if new position or an empty plot with existing data
+        needs_rebuild = switched_position or (not existing_x and os.path.exists(os.path.join(pos_path, "scan-results.json")))
+        if needs_rebuild:
+            # rebuild full history from scan-results (refreshed page or new position lost the running Patch state)
             scan_data = data_io.local_retrieve(pos_path, "scan-results", data_type='json') 
             drift_history = [
                 scan_data[k]["drift_vector_survey"]
                 for k in sorted(filter(str.isdigit, scan_data), key=int)# ensure to exclude unrelated keys
                 if scan_data[k].get("drift_vector_survey") is not None
-            ]
+            ] if scan_data else []
             drift_fig["data"][0]["x"] = [p[0] for p in drift_history]
             drift_fig["data"][0]["y"] = [p[1] for p in drift_history]
         else:
@@ -876,7 +1159,7 @@ def check_progress(n_interval, pipeline_state, folder_path, original_bboxes, cur
         drift_fig["data"][1]["hovertemplate"] = f"{idx}: {overall_drift[0]}, {overall_drift[1]}<extra></extra>"
         half = (survey_image_size or 512) // 2
         drift_fig["layout"]["xaxis"] = {"range": [-half, half]}
-        drift_fig["layout"]["yaxis"] = {"range": [-half, half]}
+        drift_fig["layout"]["yaxis"] = {"range": [half, -half]}
     percent = progress_val if progress_val is not None else 0
 
     # 4. Update the Survey Map (Green for completed, Cyan for pending)
@@ -892,7 +1175,7 @@ def check_progress(n_interval, pipeline_state, folder_path, original_bboxes, cur
             shapes.append(shape)
         fig.update_layout(shapes=shapes, margin=dict(l=0, r=0, b=0, t=0), height=800, width=800)
 
-    # 5. Handle Subscan Images
+    # 5. Handle Subscan Images # TODO this needs to be compatible with differnt filetypes
     current_src = no_update
     prev_src = no_update
     curr_img = data_io.local_retrieve(
@@ -908,7 +1191,7 @@ def check_progress(n_interval, pipeline_state, folder_path, original_bboxes, cur
         if prev_img is not None:
             prev_src = data_io.array_to_data_url_cv2(prev_img)
 
-    # 6. Handle Finished State
+    # 6. check if finished/ current progress label
     new_pipeline_state = pipeline_state
     label_text = f"Scanning Box {idx+1}/{len(original_bboxes)} ({percent:.1f}%)"
     
@@ -1119,7 +1402,7 @@ _ANALYSIS_STATUS_COLOUR = {
 @callback(
     Output('interval-check-analysis-progress', 'disabled', allow_duplicate=True),
     Output('storage-state-analysis', 'data', allow_duplicate=True),
-    Input('stage-index-counter', 'data'),
+    Input('stage-index-active', 'data'),
     prevent_initial_call=True,
 )
 def reset_analysis_on_new_position(_):
@@ -1134,7 +1417,7 @@ def reset_analysis_on_new_position(_):
     Input('interval-check-analysis-progress', 'n_intervals'),
     State('storage-state-analysis', 'data'),
     State('storage-folder-path', 'data'),
-    State('stage-index-counter', 'data'),
+    State('stage-index-active', 'data'),
     prevent_initial_call=True
 )
 def trigger_analysis(n_intervals, analysis_state, folder_path, current_index):
@@ -1206,22 +1489,27 @@ def trigger_analysis(n_intervals, analysis_state, folder_path, current_index):
     Output('progress-bar-analysis-label', 'children'),
     Output('interval-check-analysis-progress', 'disabled'),
     Input('storage-state-analysis', 'data'),
+    Input('stage-index-active', 'data'), # Reload/clear when the open position changes
     State('storage-folder-path', 'data'),
-    State('stage-index-counter', 'data'),
     prevent_initial_call=True
 )
-def check_analysis_progress(analysis_state, folder_path, current_index):
-    """Update display only when storage-state-analysis changes AKA when states changes or n_complete increments"""
-    if not folder_path or not analysis_state:
+def check_analysis_progress(analysis_state, current_index, folder_path):
+    """Update display when storage-state-analysis changes, or immediately clear/reload when the open position switches"""
+    if not folder_path:
+        raise PreventUpdate
+
+    triggered = ctx.triggered_id
+    switched_position = triggered == "stage-index-active"
+    if not switched_position and not analysis_state:
         raise PreventUpdate
 
     pos_path = os.path.join(folder_path, f"pos-{current_index}")
     data = data_io.local_retrieve(pos_path, "scan-results", data_type='json')
-    if not data:
-        raise PreventUpdate
-
-    scan_entries = {k: v for k, v in data.items() if k.isdigit()} # for box enties
+    scan_entries = {k: v for k, v in data.items() if k.isdigit()} if data else {} # for box enties
     if not scan_entries:
+        if switched_position:
+            # No analysis data for this position yet - clear old visuals from the previous one
+            return go.Figure(), "0", "Not started", True
         raise PreventUpdate
 
     #survey map coloured by analysis status

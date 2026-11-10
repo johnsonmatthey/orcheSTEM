@@ -1,0 +1,61 @@
+{
+    "vendor": "jeol",
+    "display_name": "JEOL GrandARM (ePSIC)",
+    "microscope_model": "GrandARM",
+    "holders": [
+        "Strong ST2"
+    ],
+    "connections": {
+        "pyjem": {
+            "hostname": null
+        },
+        "merlin": {
+            "hostname": "10.182.0.5"
+        }
+    },
+    "hardware": {
+        "stage": {
+            "pyjem": {}
+        },
+        "lenses": {
+            "pyjem": {}
+        },
+        "imaging": {
+            "pyjem": {
+                "detector_name": "HAADF",
+                "detector_mapping": {
+                    "HAADF": 10
+                }
+            },
+            "qd_scanengine": {
+                "enabled_inputs": [
+                    3
+                ]
+            },
+            "gatan": {
+                "signals": []
+            }
+        },
+        "4dstem_detector": {
+            "merlin": {}
+        },
+        "stemsi_detector": {
+            "gatan": {}
+        }
+    },
+    "preferences": {
+        "control": {
+            "stage": null,
+            "lenses": null,
+            "imaging": "qd_scanengine",
+            "4dstem_detector": null,
+            "stemsi_detector": null
+        },
+        "4dstem": {
+            "savepath": "X:\\data\\2026\\mg44468-3\\Merlin\\ptnp",
+            "dwell_time_us": 1000,
+            "flyback_time_us": 10000,
+            "bitdepth": 6
+        }
+    }
+}

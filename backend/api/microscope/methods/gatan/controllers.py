@@ -1,79 +1,10 @@
-﻿import threading
-import queue
-import time
-import numpy as np
+﻿import numpy as np
 from rsciio import digitalmicrograph as dm
 from scipy.ndimage import binary_dilation
 
-from microscope.controller import ImagingController, STEMSpectroscopy
-from microscope.drift_corr import drift_calc
-
-_command_queue = queue.Queue()  # Queue commands without blocking and this is what gms will poll form
-_result_store = {} # stores any results posted back from gms for submit_command to retrieve and return it
-_result_events = {} #stores threading events for each command id so submit_command can block until the result is posted back by gms
-_lock = threading.Lock()
-_cmd_counter = 0
-_last_poll_time = None  # timestamp of last GMS poll
-
-def _next_id():
-    global _cmd_counter
-    with _lock:
-        _cmd_counter += 1
-        return _cmd_counter
-
-
-def submit_command(command: str, params: dict = None, timeout: float = 120.0) -> dict:
-    """
-    Queues a command for DM and blocks until the result arrives via threading events
-    """
-    cmd_id = _next_id()
-    event = threading.Event()
-    _result_events[cmd_id] = event
-    _command_queue.put(
-        {
-            "id": cmd_id,
-            "command": command,
-            "params" : params if params else {}
-        }
-    )
-    print(f"Submitted command {command} with params {params} and id {cmd_id}")
-
-    if not event.wait(timeout=timeout):
-        _result_events.pop(cmd_id, None)
-        _result_store.pop(cmd_id, None)  # clean up in case GMS posted between timeout and here
-        return {"ok": False, "id": cmd_id, "error": "timeout"}
-
-    result = _result_store.pop(cmd_id, None)
-    _result_events.pop(cmd_id, None)
-    return {"ok": True, "id": cmd_id, "result": result}
-
-
-def poll_next() -> dict:
-    """Called by get /gms/poll"""
-    global _last_poll_time
-    _last_poll_time = time.monotonic()
-    try:
-        item = _command_queue.get_nowait()
-        return {"ok": True, "id": item["id"], "command": item["command"], "params": item.get("params", {})}
-    except queue.Empty:
-        return {"ok": True, "id": None, "command": None, "params": None}
-
-def post_result(cmd_id: int, result) -> dict:
-    """Called by POST /gms/result — wakes up the waiting submit_command."""
-    _result_store[cmd_id] = result
-    event = _result_events.get(cmd_id)
-    if event:
-        event.set()  # threading.Event.set() — wakes the blocking .wait() in submit_command
-    return {"ok": True}
-
-def gms_is_connected(timeout_s: float = 6000.0) -> bool:
-    """True if GMS has polled within the last timeout_s seconds."""
-    if _last_poll_time is None:
-        print("Checking GMS connection. No poll received yet.")
-        return False
-    elapsed = time.monotonic() - _last_poll_time
-    print(f"Checking GMS connection. Last poll was {elapsed:.2f} seconds ago.")
-    return elapsed < timeout_s
+from microscope.core.interfaces import ImagingController, STEMSpectroscopy
+from microscope.techniques.drift_corr import drift_calc
+from microscope.methods.gatan.channel import GMSChannel
 
 def gatan_box_coord(box_coords, rescaled_to_1=False, full_image_size=(512, 512)):
     """
@@ -165,8 +96,9 @@ class GatanImaging(ImagingController):
         EM_subsurvey  — subscan of a box region
         EM_SI         — spectrum imaging (spectroscopy) acquisition
     """
-    def __init__(self):
-        # Some defaulrs
+    def __init__(self, channel: GMSChannel, signals=None):
+        self._channel = channel  # how commands reach DigitalMicrograph
+        self._signals = signals or []  # list of GMS signals to acquire for this instrument - placeholder TODO to pass to the .py script from server
         self._dwell_time_s = 50e-6
         self._flyback_time_s = 1000e-6
 
@@ -223,7 +155,7 @@ class GatanImaging(ImagingController):
             "size": [width, height],
         }
         print(f"Performing GMS full survey scan of {full_image_size}")
-        result = submit_command("EM_survey", params, timeout=600.0)
+        result = self._channel.submit_command("EM_survey", params, timeout=600.0)
         if not result.get("ok"):
             raise RuntimeError(f"GMS EM_survey failed: {result.get('error', 'unknown')}")
         return self._read_dm4(savefolder, savefile)
@@ -243,7 +175,7 @@ class GatanImaging(ImagingController):
             "close_image": close_image,
         }
         print(f"Performing GMS sub-survey scan on region: {subscan_region} (width, height, x, y)")
-        result = submit_command("EM_subsurvey", params, timeout=600.0)
+        result = self._channel.submit_command("EM_subsurvey", params, timeout=600.0)
         if not result.get("ok"):
             raise RuntimeError(f"GMS EM_subsurvey failed: {result.get('error', 'unknown')}")
         return self._read_dm4(savefolder, savefile)
@@ -364,7 +296,7 @@ class GatanSpectroscopy(STEMSpectroscopy):
             # "passes": passes,
         }
         print(f"Performing GMS spectrum imaging on region: {subscan_region}")
-        result = submit_command("EM_SI", params, timeout=600.0)
+        result = self._imaging._channel.submit_command("EM_SI", params, timeout=600.0)
         if not result.get("ok"):
             raise RuntimeError(f"GMS EM_SI failed: {result.get('error', 'unknown')}")
         return savefile

@@ -2,17 +2,14 @@
 import numpy as np
 import math
 from skimage.transform import warp_polar
-from microscope.drift_corr import  drift_calc #this is the only thing in this file, could be moved to util? 
+from microscope.techniques.drift_corr import  drift_calc #this is the only thing in this file, could be moved to util? 
 from skimage.io import imread
 from data_models import schemas
 from util import data_io, preprocess
-from microscope.controller import build_controller
+from microscope.core.controller import build_controller
 # for test purposes
 import skimage as ski 
 from pathlib import Path
-
-from microscope.microscope_config import MICROSCOPE_CONFIG
-IMAGING_DETECTOR = MICROSCOPE_CONFIG.get('detector_name')
 
 def vector(shift:tuple)-> tuple:
     r = (shift[0]**2 + shift[1]**2)**0.5
@@ -64,7 +61,7 @@ def Compucentric_calibration(req: schemas.CompUcentricCal):
         #     Image2 = ski.transform.warp(img, tform.inverse)
         # else:
         abs_savefolder = Path(req.folder_path).resolve().as_posix()
-        with microscope.lenses.detector_inserted(IMAGING_DETECTOR):
+        with microscope.lenses.detector_inserted():
             with microscope.lenses.beam_unblanked():
                 Image1 = microscope.imaging.get_image(
                     full_image_size=[height, width],

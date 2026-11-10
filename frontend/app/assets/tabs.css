@@ -1,0 +1,15 @@
+/* Vertical separator and native active-tab outline */
+.blue-outline-tabs {
+    --tab-border-color: var(--mantine-color-blue-6) !important;
+}
+
+/* Explicitly override the separator pseudo-element */
+.blue-outline-tabs-list::before {
+    border-color: var(--mantine-color-blue-6) !important;
+}
+
+/* Ensure the active-tab corners use blue */
+.blue-outline-tabs-tab[data-active]::before,
+.blue-outline-tabs-tab[data-active]::after {
+    background-color: var(--mantine-color-blue-6) !important;
+}

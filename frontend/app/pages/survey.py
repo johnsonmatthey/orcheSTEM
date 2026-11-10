@@ -45,22 +45,22 @@ def experiment_controls():
                         gap="md",
                         wrap="nowrap",
                         children=[
-                            dmc.Text("Enter experiment name/number:", size="md", fw=500),
+                            # dmc.Text("Enter experiment name/number:", size="md", fw=500),
+                            dmc.Button("Scan", id="button-scan", fullWidth=True),                            
+                            # dmc.TextInput(
+                            #     id="text-input-experiment-name", 
+                            #     value="test",
+                            #     persistence=True,
+                            #     style={"flex": "1"},
+                            #     size="md"
+                            # ),
                             
-                            dmc.TextInput(
-                                id="text-input-experiment-name", 
-                                value="test",
-                                persistence=True,
-                                style={"flex": "1"},
-                                size="md"
-                            ),
-                            
-                            dmc.Button(
-                                "Create experiment", 
-                                id='button-create-experiment',
-                                variant="light",
-                                size="md",
-                            )
+                            # dmc.Button(
+                            #     "Create experiment", 
+                            #     id='button-create-experiment',
+                            #     variant="light",
+                            #     size="md",
+                            # )
                         ]
                     )
                 ]

@@ -1,15 +1,16 @@
 import numpy as np
 import h5py
 from datetime import datetime
-from microscope.drift_corr import drift_calc
+from microscope.techniques.drift_corr import drift_calc
 try:
     from pyscanengine.data import FrameMonitor
 except Exception as e:
     print(f"FrameMonitor import failed: {e}. Running in mock mode.")
 import time
 
-from microscope.controller import ImagingController, STEM4DDetector
-from microscope.merlin_commands import merlin_setup
+from microscope.core.interfaces import ImagingController, STEM4DDetector
+from microscope.core.hardware_utils import requires_controller
+from microscope.methods.merlin.commands import merlin_setup
 
 class QDImaging(ImagingController):
     def __init__(self, scan_engine, enabled_inputs=(3,)):
@@ -381,6 +382,7 @@ class QDMerlinDetector(STEM4DDetector):
         }
         return mapping.get(ht, mapping_def).get(spot_size, 0.0)
 
+    @requires_controller("_eos3")
     def export(self, file: str, scan_size: int, full_image_size: tuple, **merlin):
         """
         Export the microscope parameters to a hdf5 file.
@@ -397,8 +399,6 @@ class QDMerlinDetector(STEM4DDetector):
             The additional merlin parameters.
         """
         with h5py.File(file, "a") as f:
-            if self._eos3 is None:
-                return
             metadata_group = f.create_group('metadata')
 
             for key, value in merlin.items():

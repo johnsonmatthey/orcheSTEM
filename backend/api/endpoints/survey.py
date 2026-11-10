@@ -4,11 +4,10 @@ from fastapi import APIRouter
 from util import data_io, preprocess
 from data_models import schemas
 from skimage.io import imread
+import numpy as np
 router = APIRouter()
-from microscope.controller import build_controller
-from microscope.microscope_config import MICROSCOPE_CONFIG
-IMAGING_DETECTOR = MICROSCOPE_CONFIG.get('detector_name')
-from microscope.compucentric_tilting import Compucentric_calibration, Compucentric_tilt
+from microscope.core.controller import build_controller
+from microscope.techniques.compucentric_tilting import Compucentric_calibration, Compucentric_tilt
 
 @router.post("/scan")
 def trigger_scan(req: schemas.ScanAndSaveRequest):
@@ -16,6 +15,7 @@ def trigger_scan(req: schemas.ScanAndSaveRequest):
     microscope = build_controller(req.stage_method, req.lenses_method, req.imaging_method)
 
     scanned_img_arr = None
+    scanned_img_arr_lowmag = None
 
     # Set scan parameters
     microscope.imaging.set_dwell_time(req.dwell_time_us * 1e-6) # in seconds
@@ -23,7 +23,7 @@ def trigger_scan(req: schemas.ScanAndSaveRequest):
     box_coords = req.box_coords if req.is_subscan else None # should be width, height, x0, y0
 
     savefolder = Path(req.folder_path).resolve().as_posix()
-    with microscope.lenses.detector_inserted(IMAGING_DETECTOR):
+    with microscope.lenses.detector_inserted():
         with microscope.lenses.beam_unblanked():
             try:
                 scanned_img_arr = microscope.imaging.get_image(
@@ -34,7 +34,34 @@ def trigger_scan(req: schemas.ScanAndSaveRequest):
                 )
                 # rescale to uint8 for saving as png
                 #data_io.local_store(req.folder_path, req.filename, scanned_img_arr, data_type='array')
-                scanned_img_arr = preprocess.bytescale(scanned_img_arr) 
+                if scanned_img_arr is not None:
+                    scanned_img_arr = preprocess.bytescale(scanned_img_arr)
+
+                if box_coords is None:
+                    #save the absolute magnification+defocus used here as only should enter if doing normal survey
+                    # - this is so the same view can be reproduced after stage movement
+                    num_change = 4 # Temp for pyjem, TODO replace this with set mag logic and expose to frontend
+                    data_io.local_store(req.folder_path, req.filename + '_settings', {
+                        "magnification": microscope.lenses.get_magnification(),
+                        "defocus": microscope.lenses.get_defocus(),
+                        "low_mag_increments" : num_change 
+                    }, data_type='json')
+                    # For checking at low mag where you are etc. Testing
+                    if microscope.lenses.increment_magnification(-num_change):
+                        try:
+                            scanned_img_arr_lowmag = microscope.imaging.get_image(
+                                full_image_size=[req.survey_image_size, req.survey_image_size],
+                                subscan_region=box_coords,
+                                savefolder=savefolder,
+                                savefile=req.filename+'_lowmag',
+                            )
+                            if scanned_img_arr_lowmag is not None:
+                                scanned_img_arr_lowmag = preprocess.bytescale(scanned_img_arr_lowmag)
+                        finally:
+                            microscope.lenses.increment_magnification(num_change)
+                    else:
+                        print("Low-magnification survey unavailable; keeping the main survey image.")
+
             except Exception as e:
                 print(f"Image acquisition failed: {e}. Using dummy image.")
     
@@ -46,6 +73,8 @@ def trigger_scan(req: schemas.ScanAndSaveRequest):
     # dummy_img = imread(req.folder_path + "/" + "survey_image.tif", as_gray=True) # dummy image saved in the main folder
 
     data_io.local_store(req.folder_path, req.filename, scanned_img_arr, data_type='png')
+    if scanned_img_arr_lowmag is not None:
+        data_io.local_store(req.folder_path, req.filename + '_lowmag', scanned_img_arr_lowmag, data_type='png')
 
     return {"status": "success", "image": f"{req.filename}.png"}
 
@@ -53,13 +82,13 @@ def trigger_scan(req: schemas.ScanAndSaveRequest):
 @router.post("/save-defocus")
 def save_defocus(req: schemas.SaveDefocusRequest):
     microscope = build_controller(req.stage_method, req.lenses_method, req.imaging_method)
-    olf_value = microscope.lenses.get_defocus()
-    if olf_value is None:
-        print("Defocus not available. Skipping save.")
-        data_io.local_store(req.folder_path, f"{req.filename}", None, data_type='json')
-        return {"status": "skipped", "defocus": None}
-
+    try:
+        olf_value = microscope.lenses.get_defocus()
+    except Exception as e:
+        print("failed to get defocus value so saving as None. Error:", e)
+        olf_value = None
     print(f"Saved defocus OLf={olf_value} to {req.folder_path}/{req.filename}-defocus")
+    data_io.local_store(req.folder_path, f"{req.filename}", olf_value, data_type='json')
     return {"status": "success", "defocus": olf_value}
 
 
@@ -71,8 +100,14 @@ async def save_stage_position(req: schemas.SaveStageRequest):
     stage_location = microscope.stage.get_position()
     # in nm
     if stage_location is None:
-        print("Failed to retrieve stage position. Saving dummy position (0,0).")
-        stage_location = {'x': 0.0, 'y': 0.0}
+        print("Failed to retrieve stage position. Saving dummy positions.")
+        stage_location = {
+            "x": np.random.randint(1,1000), 
+            "y": np.random.randint(1,1000), 
+            "z": np.random.randint(1,1000),
+            'xt': 0,
+            'yt': 0,
+        }
     data_io.local_store(
         req.folder_path, 
         f'stage-position', 

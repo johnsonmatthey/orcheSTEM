@@ -1,5 +1,6 @@
 from fastapi import APIRouter, BackgroundTasks
 import time
+import traceback
 from data_models import schemas
 from util import data_io
 import os
@@ -8,17 +9,15 @@ from pathlib import Path
 import numpy as np
 import h5py
 from datetime import datetime
-from microscope.controller import build_controller
-from microscope.drift_corr import drift_calc
-from microscope.microscope_config import MICROSCOPE_CONFIG
+from microscope.core.controller import build_controller
+from microscope.techniques.drift_corr import drift_calc
 from endpoints.analysis import _append_analysis_log
+from util.stage_alignment import get_center_offset
 
 router = APIRouter()
-
-# THESE GLOBALS ARE JUST FOR TESTING!
 VERIFY_DRIFT = False # This is to acquire an extra image as soon as drift correction is applied to verify things
 RECHECK_DRIFT = False # This is to do a sanity check every 3 scans on the drift correction to catch any large drift that may have occurred
-IMAGING_DETECTOR = MICROSCOPE_CONFIG.get('detector_name')
+DO_MULTISTAGE = True # This is just to prevent stage movements for testing purposes
 
 def _write_checkpoints(hdf_path, folder_path, initial_survey, cluster_index):
     """Write reference/checkpoint images into the merlin parameter HDF5 file."""
@@ -46,7 +45,94 @@ def rescale_coords(width, height, x1,y1, scale):
 
     return new_width, new_height, shift_x1, shift_y1
 
-def background_pipeline(req):
+def _measure_lowmag_offset(microscope, pos_path, ref_img, survey_image_size, savefile, lowmag_increments=4):
+    """get a new low-mag image and feature-match it against ref_img. Returns the pixel offset (survey res), or None if the scan/match failed.
+    """
+    low_mag_img = None
+    with microscope.lenses.detector_inserted():
+        with microscope.lenses.beam_unblanked():
+            if not microscope.lenses.increment_magnification(-lowmag_increments):
+                print("Relative magnification control is unavailable. Skipping")
+                return None
+            try:
+                # TODO NOTE Make sure mags are consistent in terms of up and down increments
+                low_mag_img = microscope.imaging.get_image(
+                    full_image_size=[survey_image_size, survey_image_size],
+                    savefolder=Path(pos_path).resolve().as_posix(),
+                    savefile=savefile,
+                )
+            except Exception as e:
+                print(f"Offset check scan failed: {e}. Skipping.")
+                return None
+            finally:
+                microscope.lenses.increment_magnification(lowmag_increments)
+
+    if low_mag_img is None: # failed to get image for some reason
+        return None
+    low_mag_img = bytescale(low_mag_img)
+    data_io.local_store(pos_path, savefile, low_mag_img, data_type='png')
+
+    try: # try except in case phase correlation fails - alternative if feature match it
+        shift, response = drift_calc(ref_img, low_mag_img, max_shift_pixel=min(low_mag_img.shape)) #NOTE use same mag to track
+        print(f"drift_calc offset check response: {response:.3f}")
+        return -1 * np.array(shift) # reverse the apparent drift to get the stage correction vector
+    except Exception as e:
+        print(f"Phase correlation offset check failed: {e}. Skipping.")
+        return None
+
+def correct_stage_offset(microscope, pos_path, survey_image_size, dwell_time_us, flyback_time_us, lowmag_increments = 4):
+    """post stage movement, take survey image in low mag. feature match to survey_lowmag for the position. Use the determined pixel shift 
+    to move stage to correct for stage. Remeasure it and the final offset becomes the baseline for the drift vector
+    """
+    ref_img = data_io.local_retrieve(pos_path, "survey_lowmag", data_type='png')
+    if ref_img is None:
+        print(f"No survey_lowmag reference found in {pos_path}, skipping stage offset correction.")
+        return None
+
+    microscope.imaging.set_dwell_time(dwell_time_us * 1e-6)
+    microscope.imaging.set_flyback_time(flyback_time_us * 1e-6)
+
+    offset_px = _measure_lowmag_offset(microscope, pos_path, ref_img, survey_image_size, "stage-check", lowmag_increments=lowmag_increments)
+    if offset_px is None:
+        print("Feature matching found no stage offset correction. Skipping.")
+        return None
+    
+    pixel_size_angstrom = microscope.lenses.get_px_res(
+        microscope.imaging,
+        savefolder=Path(pos_path).resolve().as_posix(),
+        savefile="stage-check", #for gatan to read from dm4
+    )
+    if pixel_size_angstrom is None: # failed
+        return None
+
+    offset_nm = offset_px * pixel_size_angstrom / 10.0  # Angstroms -> nm
+    print(f"Stage offset detected for {pos_path} (nm): x={offset_nm[0]:.1f}, y={offset_nm[1]:.1f}")
+    microscope.stage.move_relative(float(offset_nm[0]), axis='x')
+    microscope.stage.move_relative(float(offset_nm[1]), axis='y')
+    time.sleep(2)
+
+    #Re-measure after the move
+    # TEST with another check inbetween
+    # remaining_px_shift = _measure_lowmag_offset(microscope, pos_path, ref_img, survey_image_size, "stage-check-2", lowmag_increments=lowmag_increments)
+    # if remaining_px_shift is None:
+    #     print(f"second feature match failed for {pos_path}- start drift vector at (0,0)")
+    #     return None
+    # offset_nm = offset_px * pixel_size_angstrom / 10.0  # Angstroms -> nm
+    # print(f"Second stage offset detected for {pos_path} (nm): x={offset_nm[0]:.1f}, y={offset_nm[1]:.1f}")
+    # microscope.stage.move_relative(float(offset_nm[0]), axis='x')
+    # microscope.stage.move_relative(float(offset_nm[1]), axis='y')
+    # time.sleep(2)
+
+    remaining_px_shift = _measure_lowmag_offset(microscope, pos_path, ref_img, survey_image_size, "stage-check-final", lowmag_increments=lowmag_increments)
+    if remaining_px_shift is None:
+        print(f"Final feature match failed for {pos_path}- start drift vector at (0,0)")
+        return None
+    print(f"pixel offset after feature match stage correction for {pos_path} (survey res): {remaining_px_shift}")
+    # drift vector follows the apparent object shift, which is opposite to the stage correction direction
+    return -1 * remaining_px_shift
+
+def background_pipeline(req, initial_drift_px=None):
+    """initial_drift_px expected in survey resolution"""
     microscope = build_controller(
         req.stage_method, 
         req.lenses_method, 
@@ -61,12 +147,17 @@ def background_pipeline(req):
     # NOTE make this arbitrary for scaling!
     drift_rescaling = full_image_size//survey_image_size # Rescale coords from drift correction box to this 
 
-    overall_drift_vector = [0,0] #in pixels to apply to the top left corner of the box
+    if initial_drift_px is not None:
+        #starting point if provided else do 0,0 and build up
+        overall_drift_vector = [float(initial_drift_px[0]) * drift_rescaling, float(initial_drift_px[1]) * drift_rescaling]
+        print(f"overall_drift_vector starts from: {overall_drift_vector}")
+    else:
+        overall_drift_vector = [0,0] #in pixels to apply to the top left corner of the box
     prev_drift_box_offset = np.array([0.0, 0.0])  # tracks the box origin offset (survey res) used for the previous drift survey
     boxes_scan = data_io.local_retrieve(req.folder_path,"coords",data_type='json')
     full_survey_ref = data_io.local_retrieve(req.folder_path, "survey", data_type='png') # full survey for metadata
     full_survey_mask = data_io.local_retrieve(req.folder_path, 'threshold', data_type='array')
-
+    # TODO change this to be initial_drift_survey for clarity
     initial_survey = data_io.local_retrieve(os.path.join(req.folder_path, "drift_survey"), "drift_survey-0", data_type='png')
     drift_sanity_ref = initial_survey.copy()  # stores every 3rd drift survey for sanity checks
     drift_survey_path = os.path.join(req.folder_path, "drift_survey")
@@ -74,7 +165,7 @@ def background_pipeline(req):
     focus_output_path = os.path.join(req.folder_path, "focus")
     Path(focus_output_path).mkdir(parents=True, exist_ok=True)
 
-    microscope.lenses.set_detector_position(IMAGING_DETECTOR, True) # make sure detector is inserted initially and change as needed
+    microscope.lenses.set_detector_position(inserted=True) # make sure detector is inserted initially and change as needed
     counter = 0
     total_objects = len(boxes_scan)
     data_io.local_store(req.folder_path, "long-acquisition-state", data="Started", data_type="json")# setting the initial state
@@ -118,7 +209,7 @@ def background_pipeline(req):
             focus_subscan = (fw, fh, fx1, fy1)
         microscope.lenses.autofocus(
             imaging=microscope.imaging, 
-            method = req.focus.focus_method,
+            method = req.focus.focus_method, #'pyjem',
             focus_region = req.focus.focus_region, # can be full or box
             full_image_size= (full_image_size, full_image_size),
             survey_image_size= (survey_image_size, survey_image_size),
@@ -254,7 +345,7 @@ def background_pipeline(req):
         width, height, x1,y1 = rescale_coords(width,height, x1,y1, scan_rescaling)        
         x1 += int(overall_drift_vector[0])
         y1 += int(overall_drift_vector[1])
-        height += 1 #Add extra pixel for merlin scans
+        # height += 1 #Add extra pixel for merlin scans
         
         progress_metadata = {
             "box_index": i,
@@ -267,7 +358,7 @@ def background_pipeline(req):
         }
 
         # NOW CHECK IF OUTSIDE SCANNING REGION!!!
-        is_outside_bounds = x1 < 0 or y1 < 0 or (x1 + width) > full_image_size or (y1 + height) > full_image_size
+        is_outside_bounds = x1 < 0 or y1 < 0 or (x1 + width) > full_image_size or (y1 + height + 1) > full_image_size
         if is_outside_bounds:
             print(f"Box {i} with top left {x1}, {y1} outside bounds of scan!")
             analysis_dict = {
@@ -293,27 +384,31 @@ def background_pipeline(req):
 
         # Attempt Merlin 4D STEM scan if configured
         if microscope.stem4d_detector is not None:
-            microscope.imaging.set_dwell_time(req.stem4d.dwell_time_us / 1e6)
-            microscope.imaging.set_flyback_time(req.stem4d.flyback_time_us / 1e6)
+            height += 1 #Add extra pixel for merlin scans
+            try: 
+                microscope.imaging.set_dwell_time(req.stem4d.dwell_time_us / 1e6)
+                microscope.imaging.set_flyback_time(req.stem4d.flyback_time_us / 1e6)
 
-            with microscope.lenses.detector_removed(IMAGING_DETECTOR):
-                timestamp = microscope.stem4d_detector.acquire(
-                    lenses=microscope.lenses,
-                    full_image_size=(full_image_size, full_image_size),
-                    subscan_region=(width, height, x1, y1),
-                    merlin_dwell_time_s=req.stem4d.dwell_time_us / 1e6, # convert from us to s
-                    merlin_save_path= req.stem4d.savepath,
-                    merlin_bit_depth= req.stem4d.bitdepth,
-                )
-            # Write checkpoint/reference images into the same HDF file
-            merlin_save = req.stem4d.savepath.replace("/", "\\")
-            params_savepath = f"{merlin_save}\\{timestamp}.hdf"
-            _write_checkpoints(params_savepath, req.folder_path, full_survey_ref, i)
+                with microscope.lenses.detector_removed():
+                    timestamp = microscope.stem4d_detector.acquire(
+                        lenses=microscope.lenses,
+                        full_image_size=(full_image_size, full_image_size),
+                        subscan_region=(width, height, x1, y1),
+                        merlin_dwell_time_s=req.stem4d.dwell_time_us / 1e6, # convert from us to s
+                        merlin_save_path= req.stem4d.savepath,
+                        merlin_bit_depth= req.stem4d.bitdepth,
+                    )
+                # Write checkpoint/reference images into the same HDF file
+                merlin_save = req.stem4d.savepath.replace("/", "\\")
+                params_savepath = f"{merlin_save}\\{timestamp}.hdf"
+                _write_checkpoints(params_savepath, req.folder_path, full_survey_ref, i)
+            finally:
+                height -=1 # revert to normal scan height in case SI is then done
 
         elif microscope.stemsi is not None:
             microscope.imaging.set_dwell_time(req.stemsi.dwell_time_us / 1e6)
             microscope.imaging.set_flyback_time(req.stemsi.flyback_time_us / 1e6)
-            survey_scaled_box_coords = rescale_coords(width,height-1, x1,y1, 1/scan_rescaling)
+            survey_scaled_box_coords = rescale_coords(width,height, x1,y1, 1/scan_rescaling)
 
             si_drift_region = req.drift.box_coords
             if si_drift_region is not None:
@@ -340,6 +435,10 @@ def background_pipeline(req):
         else:
             microscope.imaging.set_dwell_time(req.scan_dwell_time_us / 1e6)
             microscope.imaging.set_flyback_time(req.scan_flyback_time_us / 1e6)
+            # NOTE TODO - does QD Scan Engine require height+1 here or just for merlin?
+            # if req.imaging_method in ['qd_scanengine']:
+            #     height += 1
+            # NOTE that subscan region is defined in upscaled resolution here
             with microscope.lenses.beam_unblanked(): # make sure beam is unblanked for scanning
                 try:
                     scan_result = microscope.imaging.get_image(
@@ -391,6 +490,94 @@ async def run_search_pipeline(req: schemas.SearchPipelineRequest, background_tas
     background_tasks.add_task(background_pipeline, req)
     return {
         "status": "Submitted background task"
+    }
+
+def background_pipeline_batch(req):
+    """
+    Run the saved pipeline configurations, found via the provided list of indices that denote the pos-X folders within the 
+    experiment folder. For a given position, move to the location that is stored, then run the original
+    background_pipeline(). Overall progress stored in the batch-acquisition-state.json which is used by the frontend.
+    NOTE assumes pos-X folders start at pos-0 onwards etc.
+    """
+    experiment_path = req.folder_path
+    batch_state = {
+        "state": "Started",
+        "current_pos_index": None, # None when not running anything (setup or done)
+        "completed": [],
+        "failed": [],
+        "total": len(req.pos_order),
+    }
+    data_io.local_store(experiment_path, "batch-acquisition-state", batch_state, data_type="json")
+
+    for pos_index in req.pos_order:
+        pos_path = os.path.join(experiment_path, f"pos-{pos_index}")
+        pipeline_config = data_io.local_retrieve(pos_path, "pipeline-config", data_type="json")
+        if pipeline_config is None: # if they didn't finishing setting up a pos but did not untick the running box
+            print(f"No saved pipeline-config for pos-{pos_index}, skipping.")
+            continue
+
+        batch_state["current_pos_index"] = pos_index
+        data_io.local_store(experiment_path, "batch-acquisition-state", batch_state, data_type="json")
+
+        try:
+            #Move stage back to this position's stored coordinates before scanning
+            #NOTE could be skipped if already there but would need to check as technically the user could have messed up ordering
+            stage_position = data_io.local_retrieve(pos_path, "stage-position", data_type="json")
+            if stage_position:
+                microscope = build_controller(
+                    pipeline_config.get("stage_method"),
+                    pipeline_config.get("lenses_method"),
+                    pipeline_config.get("imaging_method"),
+                )
+                if DO_MULTISTAGE:
+                    microscope.stage.move_absolute(stage_position["x"], axis="x")
+                    microscope.stage.move_absolute(stage_position["y"], axis="y")
+                    microscope.stage.move_absolute(stage_position["z"], axis="z")
+                    time.sleep(3)  # allow the stage to settle before scanning
+
+                #restore the magnification/defocus used when this position's survey was 
+                survey_settings = data_io.local_retrieve(pos_path, "survey_settings", data_type="json")
+                if survey_settings:
+                    microscope.lenses.set_magnification(survey_settings.get("magnification"))
+                    microscope.lenses.set_defocus(survey_settings.get("defocus"))
+
+                if DO_MULTISTAGE:
+                    # Correct for stage repeatability error using feature matching against the saved survey
+                    # residual px shift is passed as the initial global drift vector
+                    initial_drift_px = correct_stage_offset(
+                        microscope,
+                        pos_path,
+                        pipeline_config.get("survey_image_size"),
+                        pipeline_config.get("scan_dwell_time_us", 15),
+                        pipeline_config.get("scan_flyback_time_us", 100),
+                    )
+                else: 
+                    initial_drift_px = None
+            else:
+                initial_drift_px = None
+
+            pipeline_req = schemas.SearchPipelineRequest(**pipeline_config) # format according to schema again
+            background_pipeline(pipeline_req, initial_drift_px=initial_drift_px) #run as before!
+
+            batch_state["completed"].append(pos_index)
+        except Exception as e:
+            # try and output the full traceback
+            tb = traceback.format_exc()
+            print(f"Position pos-{pos_index} failed during batch run: {type(e).__name__}: {e}\n{tb}")
+            batch_state["failed"].append(pos_index)
+        finally:
+            data_io.local_store(experiment_path, "batch-acquisition-state", batch_state, data_type="json")
+
+    batch_state["state"] = "Finished"
+    batch_state["current_pos_index"] = None
+    data_io.local_store(experiment_path, "batch-acquisition-state", batch_state, data_type="json")
+
+
+@router.post("/search-pipeline-batch")
+async def run_search_pipeline_batch(req: schemas.SearchPipelineBatchRequest, background_tasks: BackgroundTasks):
+    background_tasks.add_task(background_pipeline_batch, req)
+    return {
+        "status": "Submitted background batch task"
     }
 
 
