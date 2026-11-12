@@ -638,6 +638,7 @@ def acquire_drift_region(n_clicks, current_fig, method, drift_dwell_time, drift_
             "dwell_time_us": drift_dwell_time, 
             "flyback_time_us": drift_flyback_time,
             "is_subscan": is_subscan,
+            "acquire_lowmag": False,
             "box_coords": box_coords,
             "stage_method": stage_method if TEST_STAGE_METHOD is None else TEST_STAGE_METHOD, # stage_method
             "lenses_method": lenses_method if TEST_LENSES_METHOD is None else TEST_LENSES_METHOD, # lenses_method

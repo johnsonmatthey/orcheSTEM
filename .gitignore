@@ -193,3 +193,4 @@ gms_test/*
 ml_test/*
 backend/api/ml_util/*
 test_ptych/*
+test*/*

@@ -110,16 +110,17 @@ class PyJEMImaging(ImagingController):
         pass  # TODO add flyback time control
 
     @requires_controller("_current_det")
-    def get_image(self, full_image_size, subscan_region=None, survey_image_size = None, verbose = False, **kwargs):
+    def get_image(self, full_image_size, subscan_region=None, survey_image_size = None, verbose = False, restore_imaging_area=True, **kwargs):
         if subscan_region:
             return self._subscan(
                 box_coords=subscan_region,
                 full_image_size=full_image_size,
                 survey_image_size=survey_image_size,
+                restore_imaging_area=restore_imaging_area,
             )
-        return self._full_image(Height=full_image_size[1], Width=full_image_size[0])
+        return self._full_image(Height=full_image_size[1], Width=full_image_size[0], subscanning = False,survey_image_size=survey_image_size)
 
-    def _full_image(self, Height = None, Width = None):
+    def _full_image(self, Height = None, Width = None, subscanning = True, survey_image_size=None):
         """
         Get image from buffer
         """
@@ -132,23 +133,34 @@ class PyJEMImaging(ImagingController):
                 Height=ImageSize['Height']
             if Width is None:
                 Width=ImageSize['Width']
+        if not subscanning:
+            self._current_det.set_scanmode(0)  # back to full scan
 
-        print("imaging!")
+            self._current_det.set_imaging_area(Height, Width)
+            
         print("image dim:", Height, Width)
         buffer = self._current_det.snapshot_rawdata()
-        array = np.frombuffer(buffer, dtype = np.uint16)
-        array = np.frombuffer(array, dtype = '<i2')
-        array = array.reshape((Height,Width)).astype(np.int16)
 
-        # FOR ACE! - to put in config or auto check method for reading the buffer depending on microscope imaging settings
+        if not subscanning:
+            restore_size = survey_image_size if survey_image_size is not None else (Width, Height)
+            if restore_size is not None:
+                self._current_det.set_imaging_area(restore_size[0], restore_size[1])
+                time.sleep(1)
+
         # array = np.frombuffer(buffer, dtype = np.uint16)
-        # array = np.frombuffer(array, dtype = '<u2')
-        # array = array.reshape((Height,Width))
+        # array = np.frombuffer(array, dtype = '<i2')
+        # array = array.reshape((Height,Width)).astype(np.int16)
+
+        # FOR ACE!
+        array = np.frombuffer(buffer, dtype = np.uint16)
+        array = np.frombuffer(array, dtype = '<u2')
+        array = array.reshape((Height,Width))
+
         # array = bytescale(array) # scaling to 0-255 error when from np.int16 to uint8
         return array
 
     def _subscan(
-        self, box_coords, full_image_size, survey_image_size=None
+        self, box_coords, full_image_size, survey_image_size=None, restore_imaging_area=True
     ):
         """
         box_coords = (width, height, x, y), (x,y)= top left, relative to full_image_size
@@ -179,13 +191,13 @@ class PyJEMImaging(ImagingController):
             print("pyjem subscan failed:", e)
         finally:
             self._current_det.set_scanmode(0)  # back to full scan
-            restore_size = survey_image_size if survey_image_size is not None else full_image_size
-            if restore_size is not None:
-                self._current_det.set_imaging_area(restore_size[0], restore_size[1])
-            time.sleep(1)
+            if restore_imaging_area:
+                restore_size = survey_image_size if survey_image_size is not None else full_image_size
+                if restore_size is not None:
+                    self._current_det.set_imaging_area(restore_size[0], restore_size[1])
+            # time.sleep(1)
 
-        return arr
-    
+        return arr    
     def drift_correct(self, lenses:LensController, survey_size, initial_survey_img, drift_subscan_coords=None,
                       max_shift_pixel=None, window_type='hanning', **kwargs):
         """
@@ -454,6 +466,7 @@ class PyJEMLenses(LensController):
                     full_image_size = full_image_size,
                     survey_image_size=survey_image_size,
                     subscan_region=subscan_region, 
+                    restore_imaging_area=False,
                     savefolder = Path(full_save_path).resolve().as_posix(), 
                     savefile = f"focus-{str(acquisition_counter)}"
                 )

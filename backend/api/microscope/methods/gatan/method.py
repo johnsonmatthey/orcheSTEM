@@ -1,7 +1,5 @@
 from microscope.core.interfaces import Method
 from microscope.methods.gatan.channel import GMSChannel
-from microscope.methods.gatan.controllers import GatanImaging, GatanSpectroscopy
-
 
 class GatanMethod(Method):
     """
@@ -26,6 +24,7 @@ class GatanMethod(Method):
         return self.channel.is_connected()[0]  # checked live as DigitalMicrograph can start or stop polling at any time
 
     def build(self, category, instrument, built, methods):
+        from microscope.methods.gatan.controllers import GatanImaging, GatanSpectroscopy
         if category == "imaging":
             return GatanImaging(self.channel, signals=instrument.options("imaging", "gatan").get("signals"))
         if category == "stemsi_detector":

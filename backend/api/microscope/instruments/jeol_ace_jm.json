@@ -1,0 +1,59 @@
+{
+    "vendor": "jeol",
+    "display_name": "JEOL ACE",
+    "microscope_model": "JEOL ACE",
+    "holders": [
+        "Strong ST"
+    ],
+    "connections": {
+        "pyjem": {
+            "hostname": null
+        }
+    },
+    "hardware": {
+        "stage": {
+            "pyjem": {}
+        },
+        "lenses": {
+            "pyjem": {}
+        },
+        "imaging": {
+            "pyjem": {
+                "detector_name": "HAADF",
+                "detector_mapping": {
+                    "HAADF": 10
+                }
+            },
+            "gatan": {
+                "signals": []
+            }
+        },
+        "stemsi_detector": {
+            "gatan": {}
+        }
+    },
+    "preferences": {
+        "control": {
+            "stage": "pyjem",
+            "lenses": "pyjem",
+            "imaging": "gatan",
+            "4dstem_detector": null,
+            "stemsi_detector": null
+        },
+        "4dstem": {
+            "savepath": "X:\\data\\2026\\mg44468-3\\Merlin\\ptnp",
+            "dwell_time_us": 1000,
+            "flyback_time_us": 10000,
+            "bitdepth": 6
+        },
+        "stemsi": {
+            "enable_eels": false,
+            "enable_eds": true,
+            "enable_custom": false,
+            "dwell_time_us": 1000,
+            "flyback_time_us": 10000,
+            "subscan_size": 1,
+            "passes": 1
+        }
+    }
+}

@@ -1,5 +1,4 @@
 from microscope.core.interfaces import Method
-from microscope.methods.pyjem.controllers import PyJEMStage, PyJEMImaging, PyJEMLenses
 
 
 def initialise_pyjem_detector(imaging_mode):
@@ -21,7 +20,7 @@ def initialise_pyjem(imaging_mode, attempts=3):
     try:
         # detector is separated out as non issue where may want to change the detector later
         from PyJEM import TEM3
-        from PyJEM import detector
+        from PyJEM import detector  
         stage = None
         tries = 0
         while stage is None:
@@ -106,6 +105,7 @@ class PyJEMMethod(Method):
         return (self.stage if category == "stage" else self.det) is not None
 
     def build(self, category, instrument, built, methods):
+        from microscope.methods.pyjem.controllers import PyJEMStage, PyJEMImaging, PyJEMLenses
         if category == "stage":
             return PyJEMStage(self.stage)
         if category == "lenses":

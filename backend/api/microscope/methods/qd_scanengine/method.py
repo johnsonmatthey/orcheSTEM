@@ -1,5 +1,4 @@
 from microscope.core.interfaces import Method
-from microscope.methods.qd_scanengine.controllers import QDImaging
 
 
 def initialise_qd_scanengine(enabled_inputs, flyback_time, dwell_time, full_scan_size=(4096, 4096)):
@@ -63,6 +62,7 @@ class QDScanEngineMethod(Method):
         return self.engine is not None
 
     def build(self, category, instrument, built, methods):
+        from microscope.methods.qd_scanengine.controllers import QDImaging
         if category == "imaging":
             return QDImaging(self.engine, instrument.options("imaging", "qd_scanengine")["enabled_inputs"])
         raise ValueError(f"{self.label} cannot build '{category}'")

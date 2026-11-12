@@ -1,6 +1,5 @@
 from microscope.core.interfaces import Method
 from microscope.methods.merlin.commands import MERLIN_connection
-from microscope.methods.qd_scanengine.controllers import QDMerlinDetector
 
 
 def initialise_merlin_connection(hostname):
@@ -42,6 +41,7 @@ class MerlinMethod(Method):
 
     def build(self, category, instrument, built, methods):
         if category == "4dstem_detector":
+            from microscope.methods.qd_scanengine.controllers import QDMerlinDetector 
             pyjem = methods["pyjem"]  # the 4D-STEM metadata export reads PyJEM's column controllers
             def3, detector3, eos3, lens3, ht3, scan3, gun3, apt3 = pyjem.column
             return QDMerlinDetector(

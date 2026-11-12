@@ -9,6 +9,22 @@ router = APIRouter()
 from microscope.core.controller import build_controller
 from microscope.techniques.compucentric_tilting import Compucentric_calibration, Compucentric_tilt
 
+def _acquire_lowmag_image(microscope, survey_image_size, savefolder, filename, num_change):
+    if not microscope.lenses.increment_magnification(-num_change):
+        print("Low-magnification survey unavailable; keeping the main survey image.")
+        return None
+
+    try:
+        image = microscope.imaging.get_image(
+            full_image_size=[survey_image_size, survey_image_size],
+            savefolder=savefolder,
+            savefile=filename,
+        )
+        return preprocess.bytescale(image) if image is not None else None
+    finally:
+        microscope.lenses.increment_magnification(num_change)
+
+
 @router.post("/scan")
 def trigger_scan(req: schemas.ScanAndSaveRequest):
     # Build microscope controller based on config 
@@ -46,21 +62,16 @@ def trigger_scan(req: schemas.ScanAndSaveRequest):
                         "defocus": microscope.lenses.get_defocus(),
                         "low_mag_increments" : num_change 
                     }, data_type='json')
-                    # For checking at low mag where you are etc. Testing
-                    if microscope.lenses.increment_magnification(-num_change):
-                        try:
-                            scanned_img_arr_lowmag = microscope.imaging.get_image(
-                                full_image_size=[req.survey_image_size, req.survey_image_size],
-                                subscan_region=box_coords,
-                                savefolder=savefolder,
-                                savefile=req.filename+'_lowmag',
-                            )
-                            if scanned_img_arr_lowmag is not None:
-                                scanned_img_arr_lowmag = preprocess.bytescale(scanned_img_arr_lowmag)
-                        finally:
-                            microscope.lenses.increment_magnification(num_change)
-                    else:
-                        print("Low-magnification survey unavailable; keeping the main survey image.")
+
+                if box_coords is None and req.acquire_lowmag:
+                    # For checking whre you are/navigate back- testing
+                    scanned_img_arr_lowmag = _acquire_lowmag_image(
+                        microscope,
+                        req.survey_image_size,
+                        savefolder,
+                        req.filename + '_lowmag',
+                        num_change,
+                    )
 
             except Exception as e:
                 print(f"Image acquisition failed: {e}. Using dummy image.")

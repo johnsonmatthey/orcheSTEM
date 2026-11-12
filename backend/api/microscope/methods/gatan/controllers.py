@@ -116,7 +116,8 @@ class GatanImaging(ImagingController):
 
     # Main methods as seen in other imaging controllers
     def get_image(self, full_image_size, subscan_region=None,
-                  savefolder=None, savefile="scan", close_image=False, survey_image_size=None):
+                savefolder=None, savefile="scan", close_image=False, survey_image_size=None, 
+                **kwargs):
         """
         Acquire a survey or subscan image via GMS. NOTE there are extra args as we save the dm4.
         Could change to directly send the array but this keeps the metadata

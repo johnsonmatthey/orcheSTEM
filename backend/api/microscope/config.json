@@ -1,6 +1,6 @@
 {
-    "instrument": "jeol_test_offline",
-    "holder": "Fake Holder",
+    "instrument": "jeol_ace_jm",
+    "holder": "Strong ST",
     "survey_image_size": 512,
     "full_image_size": 4096,
     "rescale_uint8": true,

@@ -12,6 +12,7 @@ class ScanAndSaveRequest(BaseModel):
     dwell_time_us:int
     flyback_time_us:int
     is_subscan:bool
+    acquire_lowmag: bool = True
     box_coords:list | None = None
     # hardware options
     stage_method:str
